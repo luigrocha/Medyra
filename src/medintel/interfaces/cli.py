@@ -1,19 +1,26 @@
-"""CLI principal (Typer). Stub que crecerá con cada agente.
+"""CLI principal (Typer). Crece con cada agente.
 
-Por ahora expone:
+Comandos:
     medintel ingest --input data/input/CR.xlsx --country CR
-    medintel test-normalize "ZU#IGA RODRIGUEZ JUAN CARLOS"
+    medintel parse-name "ZU#IGA RODRIGUEZ JUAN CARLOS"
+    medintel parse-phone "506 8827-1060" --country CR
+    medintel enrich --input data/output/...__Ecuador_clean.xlsx --country EC --limit 5
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import subprocess
 import sys
 from pathlib import Path
 
+import pandas as pd
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from medintel.application.agents.enrichment import EnrichmentAgent
+from medintel.infrastructure.llm.extractors import LLMExtractor
 from medintel.normalization.names import parse_latam_name
 from medintel.normalization.phones import normalize as normalize_phone
 
@@ -61,6 +68,75 @@ def parse_phone_cmd(raw: str, country: str = "CR") -> None:
     t.add_row("type", n.line_type)
     t.add_row("country", n.country)
     console.print(t)
+
+
+@app.command()
+def enrich(
+    input: Path = typer.Option(..., exists=True, dir_okay=False, help="Excel limpio (output de ingest)"),
+    country: str = typer.Option(..., help="CR | PA | EC | MX | ..."),
+    limit: int = typer.Option(5, help="Cuántos médicos enriquecer (corre controlada)"),
+    only_missing: bool = typer.Option(True, help="Solo médicos sin email ni teléfono"),
+    use_llm: bool = typer.Option(False, "--use-llm/--no-llm", help="Usar LLM como fallback (requiere ANTHROPIC_API_KEY)"),
+    output: Path = typer.Option(Path("data/output/enrichment.json"), help="Path de salida JSON con claims"),
+) -> None:
+    """Enriquecimiento controlado: Doctoralia + Bing + LLM(opc) → claims con confidence."""
+    df = pd.read_excel(input, dtype=str).fillna("")
+    if only_missing:
+        df = df[(df.get("Correo", "") == "") & (df.get("Telefono", "") == "")]
+    df = df.head(limit)
+    console.print(f"[bold]Enriqueciendo {len(df)} médicos de {input.name} (país: {country})[/bold]")
+
+    llm = LLMExtractor() if use_llm else None
+    if use_llm and (llm is None or not llm.available):
+        console.print("[red]LLM no disponible: revisar ANTHROPIC_API_KEY o `pip install -e '.[llm]'`[/red]")
+        raise typer.Exit(2)
+
+    agent = EnrichmentAgent(country=country, llm=llm, use_llm_fallback=use_llm)
+    all_results: list[dict] = []
+
+    async def _run() -> None:
+        for _, row in df.iterrows():
+            name_str = str(row.get("Nombre", "") or "")
+            specialty = str(row.get("Especialidad", "") or "").lower()
+            name_format = "given_first" if country == "PA" else "family_first"
+            name_parts = parse_latam_name(name_str, name_format=name_format)
+            console.print(f"  → {name_parts.full_name}")
+            try:
+                result = await agent.enrich(name_parts, specialty_code=specialty)
+            except Exception as e:
+                console.print(f"    [red]error: {e}[/red]")
+                continue
+            all_results.append({
+                "name": name_parts.full_name,
+                "specialty": specialty,
+                "pages_fetched": result.pages_fetched,
+                "pages_with_name_present": result.pages_with_name_present,
+                "discovered_urls": result.discovered_urls,
+                "used_llm": result.used_llm,
+                "notes": result.notes,
+                "claims": [
+                    {
+                        "attribute": c.attribute, "value": c.value, "subkind": c.subkind,
+                        "confidence": c.confidence, "is_inferred": c.is_inferred,
+                        "source_url": c.source_url, "explanation": c.explanation,
+                    }
+                    for c in result.claims
+                ],
+            })
+            console.print(
+                f"    [green]pages={result.pages_fetched} "
+                f"with_name={result.pages_with_name_present} "
+                f"claims={len(result.claims)}{' (LLM)' if result.used_llm else ''}[/green]"
+            )
+
+    asyncio.run(_run())
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(all_results, indent=2, ensure_ascii=False))
+    console.print(f"\n📑 Resultados: {output}")
+    total_claims = sum(len(r["claims"]) for r in all_results)
+    found = sum(1 for r in all_results if r["pages_with_name_present"] > 0)
+    console.print(f"Resumen: {found}/{len(all_results)} médicos con datos encontrados; {total_claims} claims emitidos.")
 
 
 if __name__ == "__main__":
