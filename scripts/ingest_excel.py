@@ -1,17 +1,20 @@
 """Ingest tu Excel actual → limpieza + reporte de calidad.
 
-Uso:
-    python scripts/ingest_excel.py --input data/input/CR.xlsx --country CR
-    python scripts/ingest_excel.py --input data/input/PA.xlsx --country PA --sheet "Sheet1"
+Uso (auto-detect: procesa todas las hojas con su config por defecto):
+    python scripts/ingest_excel.py --input data/input/medicos-allegra-0226.xlsx
+
+Uso (una sola hoja):
+    python scripts/ingest_excel.py --input data/input/CR.xlsx --country CR --sheet "Costa Rica"
+
+Configuración por hoja (SHEET_CONFIG): asocia nombre de hoja → país + formato
+de nombre. Editable in-place sin tocar lógica de procesamiento.
 
 Salidas en `data/output/`:
-    - <stem>_clean.xlsx    Excel con celdas limpias listo para tu equipo
-    - <stem>_report.json   Métricas: filas, nulls, fixes aplicados, conflictos
-    - <stem>_issues.xlsx   Filas con problemas (typos email, phones inválidos, dupes)
+    - <stem>__<sheet>_clean.xlsx     Excel con celdas limpias listo para tu equipo
+    - <stem>__<sheet>_issues.xlsx    Solo filas con problemas detectados
+    - <stem>_report.json             Métricas agregadas por hoja
 
 NO requiere base de datos. Diseñado para dar valor día 1.
-Cuando levantes Postgres, el script `scripts/load_to_db.py` toma la salida
-y crea Physicians + Claims con confidence calibrado.
 """
 from __future__ import annotations
 
@@ -24,7 +27,6 @@ from pathlib import Path
 
 import pandas as pd
 
-# Permite ejecutar con `python scripts/ingest_excel.py` sin pip install -e .
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from medintel.normalization import emails as email_norm
@@ -44,6 +46,20 @@ COLUMN_ALIASES: dict[str, set[str]] = {
 }
 
 
+# Config por hoja: país (ISO-2) + formato de nombre.
+# El parser de nombres detecta automáticamente Title Case vs ALL CAPS,
+# pero damos el hint explícito porque es más robusto.
+SHEET_CONFIG: dict[str, dict[str, str]] = {
+    "Costa Rica": {"country": "CR", "name_format": "family_first"},
+    "Panama":     {"country": "PA", "name_format": "given_first"},
+    "Panamá":     {"country": "PA", "name_format": "given_first"},
+    "Ecuador":    {"country": "EC", "name_format": "family_first"},
+    "Mexico":     {"country": "MX", "name_format": "family_first"},
+    "México":     {"country": "MX", "name_format": "family_first"},
+    "Colombia":   {"country": "CO", "name_format": "family_first"},
+}
+
+
 def _detect_columns(df: pd.DataFrame) -> dict[str, str]:
     lower = {c.lower().strip(): c for c in df.columns}
     out: dict[str, str] = {}
@@ -54,7 +70,7 @@ def _detect_columns(df: pd.DataFrame) -> dict[str, str]:
                 break
     missing = {"specialty", "name"} - out.keys()
     if missing:
-        raise SystemExit(f"Faltan columnas obligatorias: {missing}. Columnas vistas: {list(df.columns)}")
+        raise SystemExit(f"Faltan columnas obligatorias: {missing}. Vistas: {list(df.columns)}")
     return out
 
 
@@ -80,11 +96,14 @@ class RowResult:
 @dataclass
 class Report:
     file: str
+    sheet: str
     country: str
+    name_format: str
     rows_total: int = 0
     rows_with_email: int = 0
     rows_with_phone: int = 0
     rows_complete: int = 0
+    rows_empty_both: int = 0
     fixes: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     specialty_counts: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     institutional_phones: list[str] = field(default_factory=list)
@@ -97,20 +116,21 @@ class Report:
         return d
 
 
-def process(df: pd.DataFrame, country: str) -> tuple[list[RowResult], Report]:
+def process_sheet(df: pd.DataFrame, country: str, name_format: str, sheet: str) -> tuple[list[RowResult], Report]:
     cols = _detect_columns(df)
     results: list[RowResult] = []
-    report = Report(file="", country=country, rows_total=len(df))
+    report = Report(file="", sheet=sheet, country=country, name_format=name_format, rows_total=len(df))
 
     all_phones: list[str] = []
     canonical_seen: Counter[str] = Counter()
 
-    for idx, row in df.iterrows():
+    for pos, (_, row) in enumerate(df.iterrows()):
         raw_name = str(row.get(cols["name"], "") or "")
         ñ = "#" in raw_name
-        parts: NameParts = parse_latam_name(raw_name)
+        parts: NameParts = parse_latam_name(raw_name, name_format=name_format)
         canonical = parts.full_name
-        canonical_seen[canonical] += 1
+        if canonical:
+            canonical_seen[canonical] += 1
         if ñ:
             report.fixes["ñ_recovered"] += 1
 
@@ -120,13 +140,13 @@ def process(df: pd.DataFrame, country: str) -> tuple[list[RowResult], Report]:
             report.specialty_counts[spec_code] += 1
         elif spec_raw:
             report.fixes["specialty_unmapped"] += 1
+            report.specialty_counts[f"_UNMAPPED:{spec_raw}"] += 1
 
         # Email
         email_clean: str | None = None
         email_issue: str | None = None
         email_suggestion: str | None = None
-        raw_email = row.get(cols.get("email", ""), "") if cols.get("email") else ""
-        raw_email = str(raw_email or "").strip()
+        raw_email = str(row.get(cols.get("email", ""), "") or "").strip() if cols.get("email") else ""
         if raw_email:
             had_ws = raw_email != raw_email.strip() or "\n" in raw_email or "  " in raw_email
             norm = email_norm.normalize(raw_email)
@@ -147,8 +167,7 @@ def process(df: pd.DataFrame, country: str) -> tuple[list[RowResult], Report]:
         phone_e164: str | None = None
         phone_type: str | None = None
         phone_issue: str | None = None
-        raw_phone = row.get(cols.get("phone", ""), "") if cols.get("phone") else ""
-        raw_phone = str(raw_phone or "").strip()
+        raw_phone = str(row.get(cols.get("phone", ""), "") or "").strip() if cols.get("phone") else ""
         if raw_phone:
             norm_p = phone_norm.normalize(raw_phone, country)
             if norm_p:
@@ -164,9 +183,11 @@ def process(df: pd.DataFrame, country: str) -> tuple[list[RowResult], Report]:
 
         if email_clean and phone_e164:
             report.rows_complete += 1
+        elif not email_clean and not phone_e164:
+            report.rows_empty_both += 1
 
         results.append(RowResult(
-            row_index=int(idx),
+            row_index=pos,
             raw_name=raw_name,
             name_parts={
                 "family_name_1": parts.family_name_1,
@@ -187,24 +208,19 @@ def process(df: pd.DataFrame, country: str) -> tuple[list[RowResult], Report]:
             ñ_recovered=ñ,
         ))
 
-    # Detección de teléfonos institucionales (≥3 médicos los comparten)
     inst = phone_norm.detect_institutional(all_phones, threshold=3)
     report.institutional_phones = sorted(inst)
-    # Marca el subtipo cuando aplique
     for r in results:
         if r.phone_e164 and r.phone_e164 in inst:
             r.phone_type = f"{r.phone_type}|clinic_main"
 
-    # Duplicados por nombre canónico
     report.duplicate_canonical_names = [n for n, c in canonical_seen.items() if c > 1]
-
     return results, report
 
 
-def write_outputs(results: list[RowResult], report: Report, input_path: Path, output_dir: Path) -> None:
+def write_sheet_outputs(results: list[RowResult], stem: str, sheet: str, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = input_path.stem
-
+    safe = sheet.replace(" ", "_").replace("/", "-")
     clean_rows = [{
         "Especialidad":    (r.specialty_code or r.specialty_raw or "").upper(),
         "Nombre":          r.full_name_canonical,
@@ -226,7 +242,7 @@ def write_outputs(results: list[RowResult], report: Report, input_path: Path, ou
     } for r in results]
 
     clean_df = pd.DataFrame(clean_rows)
-    clean_df.to_excel(output_dir / f"{stem}_clean.xlsx", index=False)
+    clean_df.to_excel(output_dir / f"{stem}__{safe}_clean.xlsx", index=False)
 
     issues_df = clean_df[
         (clean_df["Calidad_Email"] != "OK") |
@@ -234,38 +250,62 @@ def write_outputs(results: list[RowResult], report: Report, input_path: Path, ou
         (clean_df["Correo_sugerido"] != "")
     ]
     if not issues_df.empty:
-        issues_df.to_excel(output_dir / f"{stem}_issues.xlsx", index=False)
+        issues_df.to_excel(output_dir / f"{stem}__{safe}_issues.xlsx", index=False)
 
-    report.file = input_path.name
-    with (output_dir / f"{stem}_report.json").open("w", encoding="utf-8") as f:
-        json.dump(report.to_dict(), f, indent=2, ensure_ascii=False)
+
+def summarize(report: Report) -> str:
+    return (
+        f"  📊 {report.sheet:14} ({report.country})  "
+        f"rows={report.rows_total:5}  "
+        f"email={report.rows_with_email:5}  "
+        f"tel={report.rows_with_phone:5}  "
+        f"completos={report.rows_complete:5}  "
+        f"sin-nada={report.rows_empty_both:5}  "
+        f"Ñ={report.fixes.get('ñ_recovered', 0):3}  "
+        f"typos={report.fixes.get('email_domain_typo_detected', 0):3}  "
+        f"unmapped_esp={report.fixes.get('specialty_unmapped', 0):3}"
+    )
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--input", required=True, type=Path, help="Ruta al Excel de entrada")
-    p.add_argument("--country", required=True, choices=["CR", "PA"], help="País para parsing de teléfonos")
-    p.add_argument("--sheet", default=0, help="Nombre o índice de hoja (default: primera)")
+    p.add_argument("--input", required=True, type=Path)
+    p.add_argument("--country", help="Solo si procesas una hoja (override de SHEET_CONFIG)")
+    p.add_argument("--name-format", choices=["family_first", "given_first"], help="Override")
+    p.add_argument("--sheet", help="Nombre de hoja específica (default: todas)")
     p.add_argument("--output-dir", type=Path, default=Path("data/output"))
     args = p.parse_args()
 
     if not args.input.exists():
-        raise SystemExit(f"No existe el archivo: {args.input}")
+        raise SystemExit(f"No existe: {args.input}")
 
-    df = pd.read_excel(args.input, sheet_name=args.sheet, dtype=str).fillna("")
-    results, report = process(df, args.country)
-    write_outputs(results, report, args.input, args.output_dir)
+    xls = pd.ExcelFile(args.input)
+    sheets_to_process: list[str] = (
+        [args.sheet] if args.sheet else [str(s) for s in xls.sheet_names]
+    )
 
-    # Resumen visual rápido
-    print(f"✅ Procesadas {report.rows_total} filas de {args.input.name}")
-    print(f"   Emails válidos:           {report.rows_with_email}")
-    print(f"   Teléfonos válidos:        {report.rows_with_phone}")
-    print(f"   Completos (email+tel):    {report.rows_complete}")
-    print(f"   Ñ recuperadas:            {report.fixes.get('ñ_recovered', 0)}")
-    print(f"   Typos de dominio email:   {report.fixes.get('email_domain_typo_detected', 0)}")
-    print(f"   Teléfonos institucionales: {len(report.institutional_phones)}")
-    print(f"   Duplicados por nombre:    {len(report.duplicate_canonical_names)}")
-    print(f"📁 Salidas en {args.output_dir}/")
+    reports: list[Report] = []
+    print(f"📂 {args.input.name}  ({len(sheets_to_process)} hoja(s))")
+    for sheet in sheets_to_process:
+        cfg: dict[str, str] = SHEET_CONFIG.get(sheet, {})
+        country = args.country or cfg.get("country")
+        name_format = args.name_format or cfg.get("name_format", "family_first")
+        if not country:
+            print(f"  ⚠️  '{sheet}': sin config y sin --country. Skip.")
+            continue
+
+        df = pd.read_excel(args.input, sheet_name=sheet, dtype=str).fillna("")
+        results, report = process_sheet(df, country=country, name_format=name_format, sheet=sheet)
+        report.file = args.input.name
+        reports.append(report)
+        write_sheet_outputs(results, args.input.stem, sheet, args.output_dir)
+        print(summarize(report))
+
+    report_path = args.output_dir / f"{args.input.stem}_report.json"
+    with report_path.open("w", encoding="utf-8") as f:
+        json.dump([r.to_dict() for r in reports], f, indent=2, ensure_ascii=False)
+    print(f"\n📁 Salidas en {args.output_dir}/")
+    print(f"📑 Reporte global: {report_path}")
 
 
 if __name__ == "__main__":
