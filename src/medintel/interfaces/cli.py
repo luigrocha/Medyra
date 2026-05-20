@@ -139,5 +139,59 @@ def enrich(
     console.print(f"Resumen: {found}/{len(all_results)} médicos con datos encontrados; {total_claims} claims emitidos.")
 
 
+@app.command("verify-cr")
+def verify_cr(
+    input: Path = typer.Option(..., exists=True, dir_okay=False, help="Excel limpio de Costa Rica"),
+    limit: int = typer.Option(0, help="0 = todas las filas"),
+    output: Path = typer.Option(Path("data/output/cr_verification.xlsx"), help="Excel con verificación"),
+) -> None:
+    """Valida médicos contra el padrón oficial del Colegio Médico CR (Tier-1).
+
+    Devuelve, para cada médico: si está registrado, nombre canónico con tildes/ñ
+    correctas, especialidades autoritativas, y si la especialidad del Excel
+    coincide con la del Colegio. NO trae teléfono/email todavía (Sprint 2:
+    Playwright sobre la página de detalle).
+    """
+    from medintel.infrastructure.scrapers.colegio_cr import verify_excel_against_cr
+
+    df = pd.read_excel(input, dtype=str).fillna("")
+    if limit:
+        df = df.head(limit)
+
+    payload: list = []
+    for _, row in df.iterrows():
+        name = parse_latam_name(str(row.get("Nombre", "") or ""))
+        esp = str(row.get("Especialidad", "") or "")
+        payload.append((name, esp))
+
+    console.print(f"[bold]Verificando {len(payload)} médicos contra el Colegio Médico CR...[/bold]")
+    results = asyncio.run(verify_excel_against_cr(payload))
+
+    # Ensamblar Excel de salida con columnas extra
+    rows_out = []
+    for r in results:
+        rows_out.append({
+            "Nombre_Excel":        r.input_name,
+            "Especialidad_Excel":  r.input_specialty or "",
+            "Matched":             r.matched,
+            "Nombre_Canonico_CR":  r.canonical_name or "",
+            "Especialidades_CR":   ", ".join(r.cr_specialties),
+            "Especialidad_Coincide": "" if r.specialty_agreement is None else r.specialty_agreement,
+            "Score_Match":         round(r.score, 3),
+            "Perfil_URL":          r.profile_url or "",
+            "OID":                 r.oid or "",
+            "Notas":               "; ".join(r.notes),
+        })
+    out_df = pd.DataFrame(rows_out)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_excel(output, index=False)
+
+    matched = sum(1 for r in results if r.matched)
+    spec_disagree = sum(1 for r in results if r.specialty_agreement is False)
+    console.print(f"\n📑 Salida: {output}")
+    console.print(f"Matched: {matched}/{len(results)} ({100*matched/max(len(results),1):.1f}%)")
+    console.print(f"Especialidad NO coincide con Excel: {spec_disagree}")
+
+
 if __name__ == "__main__":
     app()
