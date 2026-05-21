@@ -44,7 +44,19 @@ OUTPUT_XLSX = OUTPUT_DIR / "medicos_costa_rica_v2.xlsx"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 SEED = "639148726507040344"
-CLINIWEB_CITIES = ["san-jose", "alajuela", "puntarenas", "limon"]
+CLINIWEB_CITIES = [
+    # Provincias principales (originales)
+    "san-jose", "alajuela", "puntarenas", "limon",
+    # Descubiertas via Chrome JS probing
+    "escazu", "perez-zeledon", "pococi", "guapiles", "palmar",
+    "san-ramon", "naranjo", "san-isidro", "coronado", "goicoechea",
+    "acosta", "san-pedro", "upala", "corredores",
+    # Descubiertas en sesión posterior
+    "santo-domingo", "san-francisco", "san-vicente", "mora", "san-marcos",
+    "el-carmen", "concepcion",
+    # Búsqueda amplia por país (captura médicos sin ciudad específica)
+    "costa-rica",
+]
 CLINICA_BIBLICA_API = "https://hcb-middleware-citas.onrender.com/api/directorio/profesionales"
 
 HEADERS = {

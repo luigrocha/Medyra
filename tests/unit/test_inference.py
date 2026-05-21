@@ -3,20 +3,20 @@ from __future__ import annotations
 
 import pytest
 
-from medintel.inference.confidence import (
+from medyra.inference.confidence import (
     SIGNAL_LOGODDS,
     score,
     threshold_bucket,
 )
-from medintel.inference.email_patterns import EmailHypothesis, generate, signals_for
-from medintel.inference.identity import (
+from medyra.inference.email_patterns import EmailHypothesis, generate, signals_for
+from medyra.inference.identity import (
     PhysicianCandidate,
     block_keys,
     cluster,
     p_match,
     pair_signals,
 )
-from medintel.normalization.names import parse_latam_name
+from medyra.normalization.names import parse_latam_name
 
 
 class TestConfidence:

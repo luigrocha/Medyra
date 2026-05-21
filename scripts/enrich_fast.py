@@ -27,13 +27,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from medintel.infrastructure.scrapers.ddg import DuckDuckGoScraper
-from medintel.inference.confidence import score
-from medintel.normalization import emails as email_norm
-from medintel.normalization import phones as phone_norm
-from medintel.normalization.names import NameParts, parse_latam_name, strip_accents
-from medintel.infrastructure.scrapers.generic import extract as generic_extract
-from medintel.infrastructure.scrapers.base import ScrapingBlocked
+from medyra.infrastructure.scrapers.ddg import DuckDuckGoScraper
+from medyra.inference.confidence import score
+from medyra.normalization import emails as email_norm
+from medyra.normalization import phones as phone_norm
+from medyra.normalization.names import NameParts, parse_latam_name, strip_accents
+from medyra.infrastructure.scrapers.generic import extract as generic_extract
+from medyra.infrastructure.scrapers.base import ScrapingBlocked
 
 RESULTS_JSONL = ROOT / "data/output/enrichment_cr_pa_results.jsonl"
 OUTPUT_DIR    = ROOT / "data/output"

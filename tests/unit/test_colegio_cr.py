@@ -8,9 +8,9 @@ import json
 
 import pytest
 
-from medintel.infrastructure.scrapers.base import FetchResult
-from medintel.infrastructure.scrapers.colegio_cr import ColegioCRScraper
-from medintel.normalization.names import parse_latam_name
+from medyra.infrastructure.scrapers.base import FetchResult
+from medyra.infrastructure.scrapers.colegio_cr import ColegioCRScraper
+from medyra.normalization.names import parse_latam_name
 
 
 _AUTOCOMPLETE_FIXTURE = json.dumps([
@@ -91,14 +91,14 @@ def test_strict_score_rejects_token_set_false_positive() -> None:
 
     token_set_ratio da 1.0; strict_name_score debe dar bajo porque Ramírez ≠ Vargas.
     """
-    from medintel.infrastructure.scrapers.colegio_cr import strict_name_score
+    from medyra.infrastructure.scrapers.colegio_cr import strict_name_score
     np = parse_latam_name("VARGAS RAMIREZ JOSE GERARDO")
     score = strict_name_score(np, "Maria Jose Vargas Vargas")
     assert score < 0.7, f"Falso positivo no detectado: score={score}"
 
 
 def test_strict_score_accepts_true_match() -> None:
-    from medintel.infrastructure.scrapers.colegio_cr import strict_name_score
+    from medyra.infrastructure.scrapers.colegio_cr import strict_name_score
     np = parse_latam_name("ZAPATA AGUILAR NATALIA")
     score = strict_name_score(np, "Natalia Patricia Zapata Aguilar")
     assert score >= 0.85, f"True match rechazado: score={score}"
@@ -106,14 +106,14 @@ def test_strict_score_accepts_true_match() -> None:
 
 def test_strict_score_rejects_different_last_names() -> None:
     """'VEGA RODRIGUEZ ADRIANA' vs 'Adriana María Vega Borbón' → distinta persona."""
-    from medintel.infrastructure.scrapers.colegio_cr import strict_name_score
+    from medyra.infrastructure.scrapers.colegio_cr import strict_name_score
     np = parse_latam_name("VEGA RODRIGUEZ ADRIANA")
     score = strict_name_score(np, "Adriana María Vega Borbón")
     assert score < 0.7, f"Falso positivo no detectado: score={score}"
 
 
 def test_specialties_list_parses_csv() -> None:
-    from medintel.infrastructure.scrapers.colegio_cr import CRPhysicianMatch
+    from medyra.infrastructure.scrapers.colegio_cr import CRPhysicianMatch
     m = CRPhysicianMatch(
         oid=1, canonical_name="X", raw_specialties="Pediatría, Neonatología, Genética",
         profile_path="/doctor/x", score=1.0,

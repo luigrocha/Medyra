@@ -29,10 +29,10 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from medintel.normalization import emails as email_norm
-from medintel.normalization import phones as phone_norm
-from medintel.normalization.names import NameParts, parse_latam_name
-from medintel.normalization.specialties import normalize_specialty
+from medyra.normalization import emails as email_norm
+from medyra.normalization import phones as phone_norm
+from medyra.normalization.names import NameParts, parse_latam_name
+from medyra.normalization.specialties import normalize_specialty
 
 
 # Mapeo flexible de nombres de columnas (case-insensitive).

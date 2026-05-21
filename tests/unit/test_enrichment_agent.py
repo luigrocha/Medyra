@@ -11,11 +11,11 @@ from pathlib import Path
 
 import pytest
 
-from medintel.application.agents.enrichment import EnrichmentAgent
-from medintel.infrastructure.scrapers.base import FetchResult
-from medintel.infrastructure.scrapers.bing import BingSearchScraper
-from medintel.infrastructure.scrapers.doctoralia import DoctoraliaScraper
-from medintel.normalization.names import parse_latam_name
+from medyra.application.agents.enrichment import EnrichmentAgent
+from medyra.infrastructure.scrapers.base import FetchResult
+from medyra.infrastructure.scrapers.bing import BingSearchScraper
+from medyra.infrastructure.scrapers.doctoralia import DoctoraliaScraper
+from medyra.normalization.names import parse_latam_name
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 

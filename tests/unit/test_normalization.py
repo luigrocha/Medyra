@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import pytest
 
-from medintel.normalization.emails import normalize as normalize_email
-from medintel.normalization.names import parse_latam_name, restore_special_chars
-from medintel.normalization.phones import normalize as normalize_phone
-from medintel.normalization.specialties import normalize_specialty
+from medyra.normalization.emails import normalize as normalize_email
+from medyra.normalization.names import parse_latam_name, restore_special_chars
+from medyra.normalization.phones import normalize as normalize_phone
+from medyra.normalization.specialties import normalize_specialty
 
 
 class TestNameParsing:

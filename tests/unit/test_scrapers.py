@@ -2,7 +2,7 @@
 
 Usan fixtures HTML estáticas — NO golpean la red.
 La integración end-to-end con red real se prueba manualmente con
-`medintel enrich --limit 5` después de revisar la config.
+`medyra enrich --limit 5` después de revisar la config.
 """
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from medintel.infrastructure.scrapers.base import FetchResult
-from medintel.infrastructure.scrapers.bing import BingSearchScraper
-from medintel.infrastructure.scrapers.doctoralia import (
+from medyra.infrastructure.scrapers.base import FetchResult
+from medyra.infrastructure.scrapers.bing import BingSearchScraper
+from medyra.infrastructure.scrapers.doctoralia import (
     DoctoraliaScraper,
     _slug,
 )

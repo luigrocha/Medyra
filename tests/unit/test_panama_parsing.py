@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from medintel.normalization.names import parse_latam_name
+from medyra.normalization.names import parse_latam_name
 
 
 @pytest.mark.parametrize("raw,fam1,fam2,given", [

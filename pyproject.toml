@@ -1,7 +1,7 @@
 [project]
-name = "medintel"
+name = "medyra"
 version = "0.1.0"
-description = "Medical Public Data Intelligence Platform — LATAM physicians"
+description = "Medyra — Medical Data Intelligence Platform — LATAM physicians"
 requires-python = ">=3.11"
 dependencies = [
     # Core
@@ -54,14 +54,14 @@ llm = [
 ]
 
 [project.scripts]
-medintel = "medintel.interfaces.cli:app"
+medyra = "medyra.interfaces.cli:app"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/medintel"]
+packages = ["src/medyra"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

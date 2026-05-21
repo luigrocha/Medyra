@@ -37,13 +37,13 @@ from pathlib import Path
 import httpx
 import pandas as pd
 
-# Agrega src/ al path para importar medintel
+# Agrega src/ al path para importar medyra
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from medintel.application.agents.enrichment import EnrichmentAgent
-from medintel.infrastructure.scrapers.ddg import DuckDuckGoScraper
-from medintel.normalization.names import parse_latam_name
+from medyra.application.agents.enrichment import EnrichmentAgent
+from medyra.infrastructure.scrapers.ddg import DuckDuckGoScraper
+from medyra.normalization.names import parse_latam_name
 
 # ─── Configuración ────────────────────────────────────────────────────────────
 
