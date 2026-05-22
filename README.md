@@ -2,7 +2,7 @@
 
 Recolección automatizada de información pública de médicos en Latinoamérica: nombres, emails, teléfonos y especialidades.
 
-**Estado actual: Fase de scraping activa — 4,811 médicos capturados.**
+**Estado actual: Fase de scraping activa — ~5,000 médicos capturados. CR: ✅ 1,063 médicos con email+teléfono.**
 
 ---
 
@@ -11,8 +11,8 @@ Recolección automatizada de información pública de médicos en Latinoamérica
 | País | Médicos | Con Email | Con Teléfono | Fuentes |
 |------|---------|-----------|--------------|---------|
 | 🇵🇦 **Panamá** | 3,921 | 3,568 (91%) | 1,557 (40%) | Cliniweb PA (4 directorios) |
-| 🇨🇷 **Costa Rica** | 890 | 329 (37%) | 681 (77%) | Cliniweb CR (28 ciudades) + Clínica Bíblica + Allegra |
-| **TOTAL** | **4,811** | **3,897 (81%)** | **2,238 (47%)** | |
+| 🇨🇷 **Costa Rica** | **1,063** | 1,063 (100%) | 1,063 (100%) | Salud 360 + CIMA + La Católica + Allegra + Cliniweb + Colegio |
+| **TOTAL** | **~4,984** | — | — | |
 
 ### Panamá — fuentes
 | Directorio | Médicos |
@@ -23,11 +23,16 @@ Recolección automatizada de información pública de médicos en Latinoamérica
 | Hospital Paitilla | 198 |
 
 ### Costa Rica — fuentes
-| Directorio | Médicos |
-|------------|---------|
-| Clínica Bíblica CR | 447 |
-| Directorio Cliniweb CR (28 ciudades) | 254 |
-| Allegra | 189 |
+| Directorio | Médicos (en Excel) | Estado |
+|------------|---------|--------|
+| Salud 360 CR (`directorio.salud360.cr`) | 271 | ✅ Completo |
+| Hospital CIMA CR (`directorio.hospitalcima.com`) | 236 | ✅ Completo |
+| Hospital La Católica CR (`directorio.hospitallacatolica.com`) | 175 | ✅ Completo |
+| Allegra | 155 | ✅ Completo |
+| **Colegio Médicos CR** (`medicoscr.hulilabs.com/es/search`) | **154** | ✅ Completo (con email+tel) |
+| Directorio Cliniweb CR (28 ciudades) | 71 | ✅ Completo |
+| Colegio Médicos CR (nombres sin contacto) | 20,103 | ✅ Sheet `Colegio_CR` en medicos_costa_rica_v2.xlsx |
+| **TOTAL con email+teléfono** | **1,063** | ✅ Meta superada |
 
 ---
 
@@ -57,6 +62,7 @@ data/output/
 scripts/
 ├── auto_scraper_cliniweb.py   ← scraper Panamá (standalone, sin Claude)
 ├── auto_scraper_cr.py         ← scraper Costa Rica (standalone, sin Claude)
+├── scrape_salud360_cr.py      ← scraper Salud 360 CR (one-shot, ~640 médicos)
 ├── setup_cron.sh              ← registra cron PA (3:00 AM diario)
 └── setup_cron_cr.sh           ← registra cron CR (3:15 AM diario)
 ```
@@ -67,8 +73,11 @@ scripts/
 # Panama
 python3 scripts/auto_scraper_cliniweb.py --pages-per-run 100
 
-# Costa Rica
+# Costa Rica (cron diario)
 python3 scripts/auto_scraper_cr.py --pages-per-run 50
+
+# Salud 360 CR (one-shot, ~5 min)
+python3 scripts/scrape_salud360_cr.py
 ```
 
 ### Activar crons (correr UNA sola vez en Terminal)
@@ -88,17 +97,19 @@ Los crons detectan cambios automáticamente: si un nuevo médico aparece en cual
 - **Cliniweb PA** (`directorio.cliniweb.com`): 4 subdirectorios, 497 páginas totales — **100% scrapeado**
 - Cron PA activo: 3:00 AM diario, detecta nuevas incorporaciones
 
-### Costa Rica ✅ ACTIVA
-- **Cliniweb CR**: 28 ciudades descubiertas via Chrome JS probing — **100% scrapeado**
-  - Ciudades: san-jose, alajuela, puntarenas, limon, escazu, perez-zeledon, pococi, guapiles, palmar, san-ramon, naranjo, san-isidro, coronado, goicoechea, acosta, san-pedro, upala, corredores, santo-domingo, san-francisco, san-vicente, mora, san-marcos, el-carmen, concepcion, costa-rica, y más
-- **Clínica Bíblica** (`hcb-middleware-citas.onrender.com/api`): 453 médicos — **completa**
-- **Allegra**: 189 médicos — **completa**
+### Costa Rica ✅ COMPLETA — 1,063 médicos con email+teléfono
+- **Salud 360 CR** (`directorio.salud360.cr`): 271 nuevos — **completa**
+- **Hospital CIMA CR** (`directorio.hospitalcima.com`): 236 nuevos — **completa** (vía Chrome JS)
+- **Hospital La Católica CR** (`directorio.hospitallacatolica.com`): 175 nuevos — **completa** (vía Chrome JS)
+- **Allegra**: 155 médicos — **completa**
+- **Colegio Médicos CR** (`medicoscr.hulilabs.com/es/search?q=medico&page=N`): 154 nuevos con contacto — **scrapeado p.1-200**
+- **Cliniweb CR**: 28 ciudades, 71 médicos — **100% agotado**
 - Cron CR activo: 3:15 AM diario
 
-### Fuentes bloqueadas / descartadas
-- Colegio de Médicos CR — sin acceso público al directorio de contactos
-- Hospital CIMA — WordPress sin datos útiles via API
-- Doctoralia CR — pendiente para próxima fase
+### Fuentes descartadas
+- Doctoralia CR — bloqueado (JWT/CORS)
+- HuliHealth CR — sin emails públicos
+- Cliniweb CR nuevas ciudades — agotado (19 ciudades adicionales = 0 resultados)
 
 ---
 
@@ -106,12 +117,22 @@ Los crons detectan cambios automáticamente: si un nuevo médico aparece en cual
 
 | Prioridad | Tarea | Estado |
 |-----------|-------|--------|
+| ✅ Lista | **CR**: 1,063 médicos con email+tel — meta superada | ✅ Completo |
 | 🔴 Alta | **Panamá**: Consejo Técnico de Salud (registro oficial) | Pendiente |
-| 🔴 Alta | **CR**: Doctoralia Costa Rica adapter | Pendiente |
 | 🟡 Media | **Ecuador**: revisión y consolidación de datos existentes | Pendiente |
 | 🟡 Media | Deduplicación cross-país (mismos médicos en múltiples fuentes) | Pendiente |
 | 🟢 Baja | Enriquecimiento: inferir emails por patrón (nombre + dominio clínica) | Pendiente |
 | 🟢 Baja | API / Review Queue para validación humana (FastAPI + Postgres) | Pendiente |
+
+---
+
+## Archivos de entrega
+
+| Archivo | Descripción | Estado |
+|---------|-------------|--------|
+| `data/output/1000_medicos_panama.xlsx` | 1,000 médicos PA — email + teléfono | ✅ Completo |
+| `data/output/1000_medicos_costa_rica.xlsx` | **1,063 médicos CR — todos con email + teléfono** | ✅ Completo |
+| `data/output/validacion_1000_medicos.xlsx` | Reporte de validación PA+CR (93.5% calidad) | ✅ Completo |
 
 ---
 
