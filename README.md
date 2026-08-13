@@ -12,7 +12,8 @@ Recolección automatizada de información pública de médicos en Latinoamérica
 |------|---------|-----------|--------------|---------|
 | 🇵🇦 **Panamá** | 3,921 | 3,568 (91%) | 1,557 (40%) | Cliniweb PA (4 directorios) |
 | 🇨🇷 **Costa Rica** | **1,063** | 1,063 (100%) | 1,063 (100%) | Salud 360 + CIMA + La Católica + Allegra + Cliniweb + Colegio |
-| **TOTAL** | **~4,984** | — | — | |
+| 🇨🇴 **Colombia** (ginecología) | **2,484** | 1,406 (57%) | 1,476 (59%) | Doctoralia CO + REPS MinSalud |
+| **TOTAL** | **~7,468** | — | — | |
 
 ### Panamá — fuentes
 | Directorio | Médicos |
@@ -33,6 +34,46 @@ Recolección automatizada de información pública de médicos en Latinoamérica
 | Directorio Cliniweb CR (28 ciudades) | 71 | ✅ Completo |
 | Colegio Médicos CR (nombres sin contacto) | 20,103 | ✅ Sheet `Colegio_CR` en medicos_costa_rica_v2.xlsx |
 | **TOTAL con email+teléfono** | **1,063** | ✅ Meta superada |
+
+### Colombia — ginecología
+
+| Fuente | Aporta | Médicos |
+|--------|--------|---------|
+| Doctoralia CO (`/ginecologo`, 146 págs + 59 ciudades) | quién es ginecólogo, dirección, consultorio, EPS, precio | 2,484 |
+| REPS MinSalud (`datos.gov.co/c36g-9fc2`, 61k prestadores) | **email y teléfono oficiales** vía cruce de nombre | 1,403 |
+| CSV semilla del cliente | contactos ya validados a mano | 11 |
+
+Cobertura de contacto: **1,406 con email (57%)**, 1,476 con teléfono, 2,380 con
+dirección de consultorio (96%).
+
+**Por qué esta combinación y no otra:**
+- Cliniweb **no opera en Colombia** (probado: `/bogota` → `nresul=0`).
+- RETHUS en datos.gov.co (`my8c-6xkk`) es **agregado** — conteos por perfil y
+  departamento, sin nombres. Inservible para contactos.
+- Doctoralia CO tiene la especialidad pero **nunca publica email**.
+- DDG/Bing se bloquean a escala (DDG tira challenge tras ~2 queries) → el
+  enriquecimiento por buscador no escala a 2.5k médicos sin API paga.
+- REPS sí trae email: 61,067 de 61,073 prestadores. Es la fuente oficial,
+  pública, por API y sin rate limit real.
+
+**Validación contra el CSV del cliente** (11 ginecólogos con email conocido):
+8 matchearon con confianza `alta`, de los cuales **2 dieron el email exacto que
+el cliente ya tenía** — REPS es la misma fuente de verdad que él usó a mano.
+Los otros 6 dieron un email personal distinto pero igualmente del médico
+(p.ej. `agalofre@hotmail.com` donde el cliente tenía `hola@ginecoalegalofre.com`).
+
+**Dos detalles técnicos que hacen o rompen el scraper:**
+1. El teléfono de Doctoralia no necesita JS: viaja completo en el selector del
+   modal — `data-id="address-73872-6013557209-1-phone"`. El botón "Mostrar
+   número" es solo una cortina visual. Solo lo publican los perfiles premium
+   (~10%), por eso el teléfono bueno viene de REPS.
+2. El WAF de Doctoralia responde **405** (no 403) a requests con headers de bot.
+   Mandar el set completo de navegador (`Sec-Fetch-*`,
+   `Upgrade-Insecure-Requests`, `Accept-Encoding`) lo convierte en 200. No
+   recortar `HEADERS` en `scrape_doctoralia_co.py`.
+
+El scraper es genérico por especialidad: `--specialty dermatologo` replica todo
+el pipeline para cualquier otro slug de doctoralia.co.
 
 ---
 
@@ -63,8 +104,20 @@ scripts/
 ├── auto_scraper_cliniweb.py   ← scraper Panamá (standalone, sin Claude)
 ├── auto_scraper_cr.py         ← scraper Costa Rica (standalone, sin Claude)
 ├── scrape_salud360_cr.py      ← scraper Salud 360 CR (one-shot, ~640 médicos)
+├── scrape_doctoralia_co.py    ← scraper Colombia (listado → ciudades → perfiles)
+├── reps_colombia.py           ← REPS MinSalud: descarga + cruce de nombres
+├── build_colombia_dataset.py  ← consolida Doctoralia + REPS + semilla → Excel
+├── enrich_emails_co.py        ← emails vía buscador (limitado: DDG bloquea)
 ├── setup_cron.sh              ← registra cron PA (3:00 AM diario)
 └── setup_cron_cr.sh           ← registra cron CR (3:15 AM diario)
+```
+
+### Colombia — pipeline completo
+
+```bash
+python3 scripts/scrape_doctoralia_co.py --phase all
+python3 scripts/reps_colombia.py --download --match
+python3 scripts/build_colombia_dataset.py --seed-csv "ruta/al/semilla.csv"
 ```
 
 ### Ejecutar manualmente
