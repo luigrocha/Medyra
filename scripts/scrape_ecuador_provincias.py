@@ -149,41 +149,105 @@ def scrape_doctoranytime(session: httpx.Client) -> list[dict]:
     for prov, cantones in PROVINCIAS.items():
         for slug, canton in cantones:
             for esp, paths in ESPECIALIDADES.items():
-                url = f"https://www.doctoranytime.ec/s/{paths['doctoranytime']}/{slug}"
-                try:
-                    r = session.get(url, headers=HEADERS)
-                except httpx.HTTPError as e:
-                    print(f"    ! {url}: {e}")
-                    continue
-                if r.status_code != 200:
-                    continue
-                n = 0
-                for block in re.findall(r'<script type="application/ld(?:\+|&#x2B;)json">(.*?)</script>', r.text, re.S):
+                base = f"https://www.doctoranytime.ec/s/{paths['doctoranytime']}/{slug}"
+                n, page = 0, 1
+                while page <= 15:
+                    url = base if page == 1 else f"{base}?p={page}"
                     try:
-                        data = json.loads(block)
-                    except json.JSONDecodeError:
-                        continue
-                    for p in _iter_physicians(data):
-                        addrs = p.get("address") or []
-                        if isinstance(addrs, dict):
-                            addrs = [addrs]
-                        a0 = addrs[0] if addrs else {}
-                        urls = p.get("url")
-                        rows.append({
-                            "Fuente": "doctoranytime",
-                            "Nombre": re.sub(r"\b(Dra?\.?)\s*$", "", p.get("name", "")).strip(),
-                            "Especialidad": esp,
-                            "Canton_busqueda": canton,
-                            "Provincia_busqueda": prov,
-                            "Ciudad": a0.get("addressLocality", ""),
-                            "Region": a0.get("addressRegion", ""),
-                            "Direccion": a0.get("streetAddress", ""),
-                            "Telefono_raw": p.get("telephone", ""),
-                            "URL": (urls[0] if isinstance(urls, list) and urls else urls) or p.get("@id", "").split("#")[0],
-                        })
-                        n += 1
+                        r = session.get(url, headers=HEADERS)
+                    except httpx.HTTPError as e:
+                        print(f"    ! {url}: {e}")
+                        break
+                    if r.status_code != 200:
+                        break
+                    page_rows = []
+                    for block in re.findall(r'<script type="application/ld(?:\+|&#x2B;)json">(.*?)</script>', r.text, re.S):
+                        try:
+                            data = json.loads(block)
+                        except json.JSONDecodeError:
+                            continue
+                        for p in _iter_physicians(data):
+                            addrs = p.get("address") or []
+                            if isinstance(addrs, dict):
+                                addrs = [addrs]
+                            a0 = addrs[0] if addrs else {}
+                            urls = p.get("url")
+                            page_rows.append({
+                                "Fuente": "doctoranytime",
+                                "Nombre": re.sub(r"\b(Dra?\.?)\s*$", "", p.get("name", "")).strip(),
+                                "Especialidad": esp,
+                                "Canton_busqueda": canton,
+                                "Provincia_busqueda": prov,
+                                "Ciudad": a0.get("addressLocality", ""),
+                                "Region": a0.get("addressRegion", ""),
+                                "Direccion": a0.get("streetAddress", ""),
+                                "Telefono_raw": p.get("telephone", ""),
+                                "URL": (urls[0] if isinstance(urls, list) and urls else urls) or p.get("@id", "").split("#")[0],
+                            })
+                    rows += page_rows
+                    n += len(page_rows)
+                    # Las páginas siguientes son "cerca de": se corta cuando ya no hay nadie de la provincia
+                    in_prov = [x for x in page_rows if strip_accents(x["Region"]).upper() == prov.upper()]
+                    if len(page_rows) < 20 or not in_prov:
+                        break
+                    page += 1
+                    time.sleep(SLEEP)
                 print(f"  [doctoranytime] {canton} {esp}: {n}")
                 time.sleep(SLEEP)
+    return rows
+
+
+# --------------------------------------------------------------------------- ecuadoctor
+ECUADOCTOR_QRY = {"MEDICINA_GENERAL": 4, "PEDIATRIA": 2}
+# Ciudades que el sitio tiene en su selector, dentro de las 3 provincias
+ECUADOCTOR_CTY = {"CUENCA": "Azuay", "GUALACEO": "Azuay", "LOJA": "Loja", "CATAMAYO": "Loja",
+                  "MACARA": "Loja", "TULCAN": "Carchi"}
+ECUADOCTOR_ESP_OK = {"MEDICINA_GENERAL": re.compile(r"MEDIC(INA|O) GENERAL", re.I),
+                     "PEDIATRIA": re.compile(r"PEDIATR", re.I)}
+
+
+def scrape_ecuadoctor(session: httpx.Client) -> list[dict]:
+    rows: list[dict] = []
+    for cty, prov in ECUADOCTOR_CTY.items():
+        for esp, qry in ECUADOCTOR_QRY.items():
+            url = f"https://www.ecuadoctor.com/modules/directorio?qry={qry}&cty={cty}"
+            try:
+                r = session.get(url, headers=HEADERS)
+            except httpx.HTTPError as e:
+                print(f"    ! {url}: {e}")
+                continue
+            soup = HTMLParser(r.text)
+            seen, n = set(), 0
+            for card in soup.css("div#filaped"):
+                m = re.search(r"abremedico\((\d+)", card.attributes.get("onclick") or "")
+                if not m or m.group(1) in seen:
+                    continue
+                seen.add(m.group(1))
+                esp_el = card.css_first("#nombremed2")
+                esp_txt = esp_el.text(strip=True) if esp_el else ""
+                if not ECUADOCTOR_ESP_OK[esp].search(strip_accents(esp_txt)):
+                    continue
+                a = card.css_first("#nombremed a")
+                dire = card.css_first("#direcmed p")
+                fono = card.css_first("#fonomed p")
+                mail = card.css_first("#mailmed p")
+                addr = dire.text(separator=" ", strip=True) if dire else ""
+                phones = re.findall(r"\(?0\d\)?[\s-]?\d{6,8}|\b0?9\d{8}\b|\b[2-7]\d{6}\b", fono.text() if fono else "")
+                rows.append({
+                    "Fuente": "ecuadoctor",
+                    "Nombre": re.sub(r"^(Dra?\.?)\s+", "", a.text(strip=True) if a else "").strip(),
+                    "Especialidad": esp,
+                    "Canton_busqueda": cty.title(),
+                    "Provincia_busqueda": prov,
+                    "Ciudad": addr.rsplit("|", 1)[-1].strip().title() if "|" in addr else cty.title(),
+                    "Direccion": addr,
+                    "Telefono_raw": phones[0] if phones else "",
+                    "Email_raw": (mail.text(strip=True) if mail else ""),
+                    "URL": f"https://www.ecuadoctor.com/modules/medico?id={m.group(1)}",
+                })
+                n += 1
+            print(f"  [ecuadoctor] {cty} {esp}: {n}")
+            time.sleep(SLEEP)
     return rows
 
 
@@ -241,12 +305,21 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
         toks = name_tokens(r["Nombre"])
         if len(toks) < 2 or NON_PERSON.search(strip_accents(r["Nombre"]).upper()):
             continue
-        ph = normalize_phone(str(r.get("Telefono_raw") or ""), "EC")
-        recs.append({**r, "Provincia": prov, "_tokens": toks,
-                     "Telefono": ph.e164 if ph else "", "Tipo_Telefono": ph.line_type if ph else ""})
+        tel = re.sub(r"[^\d]", "", str(r.get("Telefono_raw") or ""))
+        if len(tel) == 7:  # fijo sin código de área
+            tel = ("06" if prov == "Carchi" else "07") + tel
+        ph = normalize_phone(tel, "EC")
+        email = str(r.get("Email_raw") or "").strip().lower()
+        email = email if re.fullmatch(r"[\w.+-]+@[\w-]+(\.[\w-]+)+", email) else ""
+        ciudad_key = strip_accents(r.get("Ciudad") or "").upper().strip()
+        ciudad = c2p[ciudad_key][1] if ciudad_key in c2p else (r.get("Ciudad") or "")
+        recs.append({**r, "Ciudad": ciudad, "Provincia": prov, "_tokens": toks,
+                     "Telefono": ph.e164 if ph else "", "Tipo_Telefono": ph.line_type if ph else "",
+                     "Email": email})
 
     # Dedupe: misma provincia + especialidad, tokens del nombre corto ⊂ nombre largo. Preferir masquemedicos (trae tel.)
-    recs.sort(key=lambda x: (x["Fuente"] != "masquemedicos", -len(x["_tokens"])))
+    SRC_RANK = {"masquemedicos": 0, "ecuadoctor": 1, "doctoranytime": 2}
+    recs.sort(key=lambda x: (SRC_RANK.get(x["Fuente"], 9), -len(x["_tokens"])))
     kept: list[dict] = []
     for r in recs:
         ts = set(r["_tokens"])
@@ -262,6 +335,8 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
             if r["Fuente"] not in dup["Fuente"]:
                 dup["Fuente"] += f"+{r['Fuente']}"
                 dup["URL_2"] = r["URL"]
+            if not dup.get("Email") and r.get("Email"):
+                dup["Email"] = r["Email"]
             if not dup["Telefono"] and r["Telefono"]:
                 dup["Telefono"], dup["Tipo_Telefono"] = r["Telefono"], r["Tipo_Telefono"]
         else:
@@ -272,12 +347,13 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
         r["Existente_Allegra"] = "SI" if in_allegra(r["_tokens"], allegra) else "NO"
 
     df = pd.DataFrame(kept)
-    df["_score"] = (df["Telefono"] != "").astype(int)
+    df["_score"] = (df["Telefono"] != "").astype(int) + (df["Email"] != "").astype(int)
     print("  disponibles antes del cap:", df.groupby(["Provincia", "Especialidad"]).size().to_dict())
-    # Pediatras son escasos → se priorizan; luego registros con teléfono
-    df = (df.sort_values(["Provincia", "Especialidad", "_score"], ascending=[True, False, False])
-            .groupby("Provincia", group_keys=False).head(cap))
-    cols = ["Provincia", "Ciudad", "Especialidad", "Nombre", "Telefono", "Tipo_Telefono", "Direccion",
+    # Pediatras son escasos → se priorizan; luego registros con teléfono/email
+    df = df.sort_values(["Provincia", "Especialidad", "_score"], ascending=[True, False, False])
+    if cap:
+        df = df.groupby("Provincia", group_keys=False).head(cap)
+    cols = ["Provincia", "Ciudad", "Especialidad", "Nombre", "Telefono", "Tipo_Telefono", "Email", "Direccion",
             "Fuente", "Existente_Allegra", "URL", "URL_2"]
     for c in cols:
         if c not in df:
@@ -297,6 +373,7 @@ def write_excel(df: pd.DataFrame, out: Path, meta: int) -> None:
             "Meta": meta,
             "Brecha": max(meta - len(d), 0),
             "Con teléfono": int((d.Telefono != "").sum()),
+            "Con email": int((d.Email != "").sum()),
             "Nuevos (no en Allegra)": int((d.Existente_Allegra == "NO").sum()),
             "Fuentes": ", ".join(f"{k}: {v}" for k, v in d.Fuente.value_counts().items()),
         })
@@ -315,7 +392,8 @@ def write_excel(df: pd.DataFrame, out: Path, meta: int) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", type=Path, default=ROOT / "data")
-    ap.add_argument("--cap", type=int, default=500)
+    ap.add_argument("--cap", type=int, default=0, help="máximo por provincia (0 = sin tope)")
+    ap.add_argument("--meta", type=int, default=500)
     ap.add_argument("--refresh", action="store_true", help="ignorar cache JSON y volver a scrapear")
     args = ap.parse_args()
     out_dir = args.data_dir / "output"
@@ -323,7 +401,8 @@ def main() -> None:
 
     session = httpx.Client(follow_redirects=True, timeout=20)
     raw: list[dict] = []
-    for name, fn in [("masquemedicos", scrape_masquemedicos), ("doctoranytime", scrape_doctoranytime)]:
+    for name, fn in [("masquemedicos", scrape_masquemedicos), ("doctoranytime", scrape_doctoranytime),
+                     ("ecuadoctor", scrape_ecuadoctor)]:
         cache = out_dir / f"EC_raw_{name}.json"
         if cache.exists() and not args.refresh:
             rows = json.loads(cache.read_text())
@@ -335,7 +414,7 @@ def main() -> None:
 
     df = build(raw, args.data_dir, args.cap)
     out = out_dir / "ecuador_azuay_loja_carchi.xlsx"
-    write_excel(df, out, args.cap)
+    write_excel(df, out, args.meta)
     print(f"\n→ {out}")
 
 
