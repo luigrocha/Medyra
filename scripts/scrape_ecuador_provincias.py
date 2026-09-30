@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Scraper: Ecuador — Médicos Generales + Pediatras por provincia (Azuay, Loja, Carchi)
+Scraper: Ecuador — Médicos Generales, Pediatras e Internistas por provincia (Azuay, Loja, Carchi)
+
+Grupos de entrega (una hoja cada uno): la provincia pedida + vecinas que la complementan
+  Azuay | Loja (+ El Oro, Zamora Chinchipe) | Carchi (+ Imbabura)
+Cada fila lleva su Provincia real y Tipo = "Provincia pedida" / "Provincia vecina".
 
 Fuentes (validadas 2026-09-30):
-  - masquemedicos.ec   /{medicos-generales,pediatras}_{canton}/page/N/   (schema.org, con teléfono)
-  - doctoranytime.ec   /s/{Medico-general,Pediatra}/{canton}              (JSON-LD, solo pág. 1 estática, sin teléfono)
-  Descartadas: ecuamedical (ahora solo Quito), Doctoralia (no opera en EC),
-  citamedica (6 médicos en Cuenca), ACESS/datosabiertos (403, sin provincia).
+  - masquemedicos.ec   /{medicos-generales,pediatras,medicos-internistas}_{canton}/page/N/  (schema.org, con teléfono)
+  - doctoranytime.ec   /s/{Medico-general,Pediatra}/{canton}?p=N   (JSON-LD, sin teléfono; sin categoría de interna)
+  - ecuadoctor.com     /modules/directorio?qry={4,2,17}&cty=CIUDAD   (teléfono + email, pocos registros)
+  Descartadas: ecuamedical (ahora solo Quito), Doctoralia (no opera en EC), citamedica (casi vacío),
+  ACESS/datosabiertos (403, sin provincia), directorios de clínicas detrás de formularios.
 
 Flujo:
   1. scrape  → data/output/EC_raw_{fuente}.json   (cache: re-correr no vuelve a pedir si existe; --refresh)
-  2. build   → dedupe entre fuentes, filtro por provincia, cruce con la base Ecuador existente
-               (medicos-allegra-0226__Ecuador_clean.xlsx) y cap por provincia.
-  Output: data/output/ecuador_azuay_loja_carchi.xlsx (hojas Azuay, Loja, Carchi, Resumen)
+  2. build   → dedupe entre fuentes, provincia según dirección real, cruce con la base Ecuador existente
+               (medicos-allegra-0226__Ecuador_clean.xlsx), tope opcional por grupo (--cap).
+  Output: data/output/ecuador_azuay_loja_carchi.xlsx (hojas Resumen, Azuay, Loja, Carchi)
 
 Uso:
   python scripts/scrape_ecuador_provincias.py --data-dir "<repo>/data"
@@ -51,10 +56,23 @@ PROVINCIAS: dict[str, list[tuple[str, str]]] = {
              ("saraguro", "Saraguro"), ("alamor", "Alamor"), ("catacocha", "Catacocha"), ("zapotillo", "Zapotillo")],
     "Carchi": [("tulcan", "Tulcán"), ("san-gabriel", "San Gabriel"), ("el-angel", "El Ángel"), ("mira", "Mira"),
                ("huaca", "Huaca"), ("bolivar", "Bolívar")],
+    # Provincias vecinas: complementan a Carchi (Imbabura) y a Loja (El Oro, Zamora Chinchipe)
+    "Imbabura": [("ibarra", "Ibarra"), ("otavalo", "Otavalo"), ("cotacachi", "Cotacachi"),
+                 ("atuntaqui", "Atuntaqui"), ("pimampiro", "Pimampiro"), ("urcuqui", "Urcuquí")],
+    "El Oro": [("machala", "Machala"), ("pasaje", "Pasaje"), ("santa-rosa", "Santa Rosa"),
+               ("huaquillas", "Huaquillas"), ("pinas", "Piñas"), ("zaruma", "Zaruma"),
+               ("el-guabo", "El Guabo"), ("arenillas", "Arenillas")],
+    "Zamora Chinchipe": [("zamora", "Zamora"), ("yantzaza", "Yantzaza"), ("zumba", "Zumba")],
 }
+# Provincia real → grupo de entrega (hoja del Excel)
+GRUPO = {"Azuay": "Azuay", "Loja": "Loja", "Carchi": "Carchi",
+         "Imbabura": "Carchi", "El Oro": "Loja", "Zamora Chinchipe": "Loja"}
+GRUPOS = ["Azuay", "Loja", "Carchi"]
 ESPECIALIDADES = {
     "MEDICINA_GENERAL": {"masquemedicos": "medicos-generales", "doctoranytime": "Medico-general"},
     "PEDIATRIA": {"masquemedicos": "pediatras", "doctoranytime": "Pediatra"},
+    # doctoranytime.ec no tiene categoría de medicina interna
+    "MEDICINA_INTERNA": {"masquemedicos": "medicos-internistas", "doctoranytime": None},
 }
 TITLES = {"DR", "DRA", "DOCTOR", "DOCTORA", "MD", "MG", "ESP", "MSC", "LIC"}
 # Fichas que son establecimientos, no personas
@@ -149,6 +167,8 @@ def scrape_doctoranytime(session: httpx.Client) -> list[dict]:
     for prov, cantones in PROVINCIAS.items():
         for slug, canton in cantones:
             for esp, paths in ESPECIALIDADES.items():
+                if not paths["doctoranytime"]:
+                    continue
                 base = f"https://www.doctoranytime.ec/s/{paths['doctoranytime']}/{slug}"
                 n, page = 0, 1
                 while page <= 15:
@@ -186,9 +206,11 @@ def scrape_doctoranytime(session: httpx.Client) -> list[dict]:
                             })
                     rows += page_rows
                     n += len(page_rows)
-                    # Las páginas siguientes son "cerca de": se corta cuando ya no hay nadie de la provincia
-                    in_prov = [x for x in page_rows if strip_accents(x["Region"]).upper() == prov.upper()]
-                    if len(page_rows) < 20 or not in_prov:
+                    # Para cantones chicos el sitio rellena con médicos "cerca de" (la capital):
+                    # solo se pagina mientras la página sea mayormente del cantón buscado
+                    in_canton = [x for x in page_rows
+                                 if strip_accents(x["Ciudad"]).upper() == strip_accents(canton).upper()]
+                    if len(page_rows) < 20 or len(in_canton) < len(page_rows) / 2:
                         break
                     page += 1
                     time.sleep(SLEEP)
@@ -198,21 +220,25 @@ def scrape_doctoranytime(session: httpx.Client) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- ecuadoctor
-ECUADOCTOR_QRY = {"MEDICINA_GENERAL": 4, "PEDIATRIA": 2}
+ECUADOCTOR_QRY = {"MEDICINA_GENERAL": 4, "PEDIATRIA": 2, "MEDICINA_INTERNA": 17}
 # Ciudades que el sitio tiene en su selector, dentro de las 3 provincias
 ECUADOCTOR_CTY = {"CUENCA": "Azuay", "GUALACEO": "Azuay", "LOJA": "Loja", "CATAMAYO": "Loja",
-                  "MACARA": "Loja", "TULCAN": "Carchi"}
+                  "MACARA": "Loja", "TULCAN": "Carchi",
+                  "IBARRA": "Imbabura", "OTAVALO": "Imbabura", "ATUNTAQUI": "Imbabura", "COTACACHI": "Imbabura",
+                  "MACHALA": "El Oro", "SANTA ROSA | EL ORO": "El Oro",
+                  "YANTZAZA": "Zamora Chinchipe", "YACUAMBI": "Zamora Chinchipe"}
 ECUADOCTOR_ESP_OK = {"MEDICINA_GENERAL": re.compile(r"MEDIC(INA|O) GENERAL", re.I),
-                     "PEDIATRIA": re.compile(r"PEDIATR", re.I)}
+                     "PEDIATRIA": re.compile(r"PEDIATR", re.I),
+                     "MEDICINA_INTERNA": re.compile(r"INTERN", re.I)}
 
 
 def scrape_ecuadoctor(session: httpx.Client) -> list[dict]:
     rows: list[dict] = []
     for cty, prov in ECUADOCTOR_CTY.items():
         for esp, qry in ECUADOCTOR_QRY.items():
-            url = f"https://www.ecuadoctor.com/modules/directorio?qry={qry}&cty={cty}"
+            url = "https://www.ecuadoctor.com/modules/directorio"
             try:
-                r = session.get(url, headers=HEADERS)
+                r = session.get(url, params={"qry": qry, "cty": cty}, headers=HEADERS)
             except httpx.HTTPError as e:
                 print(f"    ! {url}: {e}")
                 continue
@@ -237,9 +263,9 @@ def scrape_ecuadoctor(session: httpx.Client) -> list[dict]:
                     "Fuente": "ecuadoctor",
                     "Nombre": re.sub(r"^(Dra?\.?)\s+", "", a.text(strip=True) if a else "").strip(),
                     "Especialidad": esp,
-                    "Canton_busqueda": cty.title(),
+                    "Canton_busqueda": cty.split("|")[0].strip().title(),
                     "Provincia_busqueda": prov,
-                    "Ciudad": addr.rsplit("|", 1)[-1].strip().title() if "|" in addr else cty.title(),
+                    "Ciudad": addr.rsplit("|", 1)[-1].strip().title() if "|" in addr else cty.split("|")[0].strip().title(),
                     "Direccion": addr,
                     "Telefono_raw": phones[0] if phones else "",
                     "Email_raw": (mail.text(strip=True) if mail else ""),
@@ -307,13 +333,13 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
             continue
         tel = re.sub(r"[^\d]", "", str(r.get("Telefono_raw") or ""))
         if len(tel) == 7:  # fijo sin código de área
-            tel = ("06" if prov == "Carchi" else "07") + tel
+            tel = ("06" if prov in ("Carchi", "Imbabura") else "07") + tel
         ph = normalize_phone(tel, "EC")
         email = str(r.get("Email_raw") or "").strip().lower()
         email = email if re.fullmatch(r"[\w.+-]+@[\w-]+(\.[\w-]+)+", email) else ""
         ciudad_key = strip_accents(r.get("Ciudad") or "").upper().strip()
         ciudad = c2p[ciudad_key][1] if ciudad_key in c2p else (r.get("Ciudad") or "")
-        recs.append({**r, "Ciudad": ciudad, "Provincia": prov, "_tokens": toks,
+        recs.append({**r, "Ciudad": ciudad, "Provincia": prov, "Grupo": GRUPO[prov], "_tokens": toks,
                      "Telefono": ph.e164 if ph else "", "Tipo_Telefono": ph.line_type if ph else "",
                      "Email": email})
 
@@ -348,28 +374,36 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
 
     df = pd.DataFrame(kept)
     df["_score"] = (df["Telefono"] != "").astype(int) + (df["Email"] != "").astype(int)
-    print("  disponibles antes del cap:", df.groupby(["Provincia", "Especialidad"]).size().to_dict())
-    # Pediatras son escasos → se priorizan; luego registros con teléfono/email
-    df = df.sort_values(["Provincia", "Especialidad", "_score"], ascending=[True, False, False])
+    print("  disponibles:", df.groupby(["Provincia", "Especialidad"]).size().to_dict())
+    # Orden de prioridad dentro de cada grupo: provincia pedida antes que vecinas,
+    # pediatras (escasos) > medicina general > medicina interna, luego con teléfono/email
+    df["_vecina"] = (df["Provincia"] != df["Grupo"]).astype(int)
+    df["_esp"] = df["Especialidad"].map({"PEDIATRIA": 0, "MEDICINA_GENERAL": 1, "MEDICINA_INTERNA": 2})
+    df = df.sort_values(["Grupo", "_vecina", "_esp", "_score"], ascending=[True, True, True, False])
     if cap:
-        df = df.groupby("Provincia", group_keys=False).head(cap)
-    cols = ["Provincia", "Ciudad", "Especialidad", "Nombre", "Telefono", "Tipo_Telefono", "Email", "Direccion",
+        df = df.groupby("Grupo", group_keys=False).head(cap)
+    df["Tipo"] = df["_vecina"].map({0: "Provincia pedida", 1: "Provincia vecina"})
+    cols = ["Grupo", "Provincia", "Tipo", "Ciudad", "Especialidad", "Nombre", "Telefono", "Tipo_Telefono", "Email", "Direccion",
             "Fuente", "Existente_Allegra", "URL", "URL_2"]
     for c in cols:
         if c not in df:
             df[c] = ""
-    return df[cols].fillna("").sort_values(["Provincia", "Especialidad", "Ciudad", "Nombre"])
+    return df[cols].fillna("").sort_values(["Grupo", "Tipo", "Provincia", "Especialidad", "Ciudad", "Nombre"])
 
 
 def write_excel(df: pd.DataFrame, out: Path, meta: int) -> None:
     resumen = []
-    for prov in PROVINCIAS:
-        d = df[df.Provincia == prov]
+    for grupo in GRUPOS:
+        d = df[df.Grupo == grupo]
+        pedida = d[d.Provincia == grupo]
         resumen.append({
-            "Provincia": prov,
+            "Grupo": grupo,
             "Medicina General": int((d.Especialidad == "MEDICINA_GENERAL").sum()),
             "Pediatría": int((d.Especialidad == "PEDIATRIA").sum()),
+            "Medicina Interna": int((d.Especialidad == "MEDICINA_INTERNA").sum()),
             "Total": len(d),
+            "Provincia pedida (MG+Ped)": int((pedida.Especialidad != "MEDICINA_INTERNA").sum()),
+            "Por provincia": ", ".join(f"{k}: {v}" for k, v in d.Provincia.value_counts().items()),
             "Meta": meta,
             "Brecha": max(meta - len(d), 0),
             "Con teléfono": int((d.Telefono != "").sum()),
@@ -379,8 +413,8 @@ def write_excel(df: pd.DataFrame, out: Path, meta: int) -> None:
         })
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         pd.DataFrame(resumen).to_excel(xw, sheet_name="Resumen", index=False)
-        for prov in PROVINCIAS:
-            df[df.Provincia == prov].to_excel(xw, sheet_name=prov, index=False)
+        for grupo in GRUPOS:
+            df[df.Grupo == grupo].to_excel(xw, sheet_name=grupo, index=False)
         for ws in xw.book.worksheets:
             for col in ws.columns:
                 width = max(len(str(c.value or "")) for c in col[:200])
