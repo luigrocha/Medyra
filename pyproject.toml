@@ -30,6 +30,7 @@ dependencies = [
     "tenacity>=8.2",
     "selectolax>=0.3.21",
     "playwright>=1.42",
+    "pypdf>=4.0",  # directorios LOTAIP (PDF) de instituciones públicas
     # Queue / cache
     "redis>=5.0",
     "rq>=1.16",
