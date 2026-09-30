@@ -282,7 +282,9 @@ def scrape_ecuadoctor(session: httpx.Client) -> list[dict]:
 # Directorios institucionales publicados por ley (LOTAIP art. 7 literal b1): nombre, puesto, ciudad,
 # teléfono y email institucional de cada servidor. Formato estándar en todo el sector público.
 LOTAIP_DOCS = [
-    # (fuente, fecha, url, archivo cache)
+    # (fuente, fecha, url, archivo cache) — el más reciente primero: gana en el dedupe
+    ("iess", "2023-09", "https://www.iess.gob.ec/informacion/Transparencia/Septiembre_2023/Literal_b1.pdf",
+     "iess_lotaip_b1_2023-09.pdf"),
     ("iess", "2023-06", "https://www.iess.gob.ec/informacion/Transparencia/Junio_2023/Literal_b1.pdf",
      "iess_lotaip_b1_2023-06.pdf"),
     # Hospital San Vicente de Paúl (MSP, Ibarra) — carpeta LOTAIP 2024 en hsvp.gob.ec
@@ -293,8 +295,44 @@ LOTAIP_PUESTO = [
     (re.compile(r"^MEDICO/A GENERAL\b"), "MEDICINA_GENERAL"),
     (re.compile(r"^MEDICO/A ESPECIALISTA EN PEDIATRIA\b"), "PEDIATRIA"),
     (re.compile(r"^MEDICO/A ESPECIALISTA EN MEDICINA INTERNA\b"), "MEDICINA_INTERNA"),
+    (re.compile(r"^MEDICO/A ESPECIALISTA EN MEDICINA FAMILIAR\b"), "MEDICINA_FAMILIAR"),
+    (re.compile(r"^MEDICO/A ESPECIALISTA EN EMERGENCIA"), "MEDICINA_EMERGENCIAS"),
 ]
+# Directorios LOTAIP descargados a mano (p. ej. MSP, que no responde desde todas las redes):
+# data/input/lotaip/*.pdf|csv|xlsx — la fuente toma el nombre del archivo
+LOTAIP_INPUT_DIR = "input/lotaip"
 _LOTAIP_PHONE = re.compile(r" (\(593\)\s*0?\d[\d ]{6,10}\d|0\d{8})\b")
+
+
+def _lotaip_row(fuente: str, fecha: str, url: str, nombre: str, puesto: str, ciudad_txt: str,
+                telefono: str, email: str, unidad: str, cantones: list) -> dict | None:
+    esp = next((e for rx, e in LOTAIP_PUESTO if rx.search(strip_accents(puesto).upper())), None)
+    if not esp:
+        return None
+    ciudad_up = " " + strip_accents(ciudad_txt).upper().strip()
+    hit = next(((prov, canon) for c, prov, canon in cantones if ciudad_up.endswith(" " + c)), None)
+    if not hit:
+        return None
+    prov, canon = hit
+    email = email.strip()
+    return {
+        "Fuente": fuente,
+        "Nombre": nombre.strip().title(),  # formato APELLIDOS NOMBRES
+        "Especialidad": esp,
+        "Canton_busqueda": canon,
+        "Provincia_busqueda": prov,
+        "Ciudad": canon,
+        "Direccion": unidad,
+        "Telefono_raw": re.sub(r"^\(?593\)?\s*", "", telefono.strip()),
+        # el PDF a veces corta el ".ec" final en otra línea
+        "Email_raw": email + (".ec" if email.lower().endswith(".gob") else ""),
+        "URL": url,
+        "Fecha_fuente": fecha,
+    }
+
+
+def _cantones() -> list[tuple[str, str, str]]:
+    return [(strip_accents(nombre).upper(), prov, nombre) for prov, lst in PROVINCIAS.items() for _, nombre in lst]
 
 
 def parse_lotaip(pdf: Path, fuente: str, fecha: str, url: str) -> list[dict]:
@@ -303,7 +341,7 @@ def parse_lotaip(pdf: Path, fuente: str, fecha: str, url: str) -> list[dict]:
     txt = "\n".join(pg.extract_text() for pg in PdfReader(pdf).pages)
     txt = re.sub(r"No\. Apellidos y Nombres.*?Correo Electr[oó]nico institucional", "", txt, flags=re.S)
     txt = re.sub(r"Art\. 7 de la Ley.*?\n|Literal b1\).*?\n|logotipo institucional imagen jpg", "", txt)
-    cantones = [(strip_accents(nombre).upper(), prov, nombre) for prov, lst in PROVINCIAS.items() for _, nombre in lst]
+    cantones = _cantones()
     rows: list[dict] = []
     prev = 0
     # Cada registro termina en su email: se corta el texto email a email
@@ -314,36 +352,69 @@ def parse_lotaip(pdf: Path, fuente: str, fecha: str, url: str) -> list[dict]:
         if not mm:
             continue
         nombre, resto = mm.groups()
-        resto_up = strip_accents(resto).upper()
-        esp = next((e for rx, e in LOTAIP_PUESTO if rx.search(resto_up)), None)
-        if not esp:
-            continue
         ph = _LOTAIP_PHONE.search(resto)
         if not ph:
             continue
-        antes = resto_up[:ph.start()]
-        hit = next(((prov, canon) for c, prov, canon in cantones if antes.endswith(" " + c)), None)
-        if not hit:
-            continue
-        prov, canon = hit
-        rows.append({
-            "Fuente": fuente,
-            "Nombre": nombre.title(),  # formato APELLIDOS NOMBRES
-            "Especialidad": esp,
-            "Canton_busqueda": canon,
-            "Provincia_busqueda": prov,
-            "Ciudad": canon,
-            "Direccion": resto[:ph.start()],
-            "Telefono_raw": re.sub(r"^\(593\)\s*", "", ph.group(1)),
-            # el PDF a veces corta el ".ec" final en otra línea
-            "Email_raw": m.group(0) + (".ec" if m.group(0).lower().endswith(".gob") else ""),
-            "URL": url,
-            "Fecha_fuente": fecha,
-        })
+        row = _lotaip_row(fuente, fecha, url, nombre, resto, resto[:ph.start()], ph.group(1), m.group(0),
+                          resto[:ph.start()], cantones)
+        if row:
+            rows.append(row)
     return rows
 
 
-def scrape_lotaip(session: httpx.Client, cache_dir: Path) -> list[dict]:
+def parse_lotaip_tabular(path: Path, fuente: str) -> list[dict]:
+    """CSV/XLSX de datos abiertos LOTAIP (formato 2024+): se detectan las columnas por su encabezado."""
+    if path.suffix.lower() == ".csv":
+        df = None
+        for enc in ("utf-8-sig", "latin-1"):
+            try:
+                df = pd.read_csv(path, sep=None, engine="python", dtype=str, encoding=enc)
+                break
+            except UnicodeDecodeError:
+                continue
+    else:
+        df = pd.read_excel(path, dtype=str)
+    if df is None or df.empty:
+        return []
+    # El encabezado a veces no está en la primera fila: buscar la fila que nombra "correo"
+    if not any("correo" in str(c).lower() for c in df.columns):
+        for i in range(min(15, len(df))):
+            if any("correo" in str(v).lower() for v in df.iloc[i].values):
+                df.columns = df.iloc[i].values
+                df = df.iloc[i + 1:]
+                break
+
+    def col(*keys: str) -> str | None:
+        for c in df.columns:
+            cl = strip_accents(str(c)).lower()
+            if all(k in cl for k in keys):
+                return c
+        return None
+
+    c_nom = col("apellidos") or col("nombre")
+    c_pue = col("puesto") or col("cargo")
+    c_ciu = col("ciudad") or col("canton")
+    c_tel = col("telefono")
+    c_ext = col("extension")
+    c_mail = col("correo")
+    c_uni = col("unidad")
+    if not all([c_nom, c_pue, c_ciu, c_mail]):
+        print(f"  [lotaip] {path.name}: no se reconocen columnas {list(df.columns)[:12]}")
+        return []
+    cantones = _cantones()
+    rows = []
+    for r in df.fillna("").to_dict("records"):
+        tel = str(r.get(c_tel, "")) if c_tel else ""
+        row = _lotaip_row(fuente, "", str(path.name), str(r[c_nom]), str(r[c_pue]), str(r[c_ciu]),
+                          tel, str(r[c_mail]), str(r.get(c_uni, "")) if c_uni else "", cantones)
+        if row:
+            if c_ext and str(r.get(c_ext, "")).strip().isdigit():
+                row["Direccion"] = f"{row['Direccion']} (ext. {str(r[c_ext]).strip()})".strip()
+            rows.append(row)
+    return rows
+
+
+def scrape_lotaip(session: httpx.Client, cache_dir: Path, input_dir: Path) -> list[dict]:
     try:
         import pypdf  # noqa: F401
     except ImportError:
@@ -360,7 +431,17 @@ def scrape_lotaip(session: httpx.Client, cache_dir: Path) -> list[dict]:
                     for chunk in r.iter_bytes():
                         f.write(chunk)
         got = parse_lotaip(pdf, fuente, fecha, url)
-        print(f"  [lotaip] {fuente} ({fecha}): {len(got)} médicos MG/Ped/Interna en las provincias objetivo")
+        print(f"  [lotaip] {fuente} ({fecha}): {len(got)} médicos en las provincias objetivo")
+        rows += got
+    for f in sorted(input_dir.glob("*")) if input_dir.exists() else []:
+        fuente = "lotaip_" + re.sub(r"[^a-z0-9]+", "_", strip_accents(f.stem).lower()).strip("_")
+        if f.suffix.lower() == ".pdf":
+            got = parse_lotaip(f, fuente, "", f.name)
+        elif f.suffix.lower() in (".csv", ".xlsx", ".xls"):
+            got = parse_lotaip_tabular(f, fuente)
+        else:
+            continue
+        print(f"  [lotaip] {f.name}: {len(got)} médicos en las provincias objetivo")
         rows += got
     return rows
 
@@ -388,7 +469,7 @@ def load_allegra(data_dir: Path) -> dict[str, list[set[str]]]:
         print(f"  (sin base Ecuador existente en {f})")
         return {}
     df = pd.read_excel(f)
-    df = df[df["Especialidad"].isin(ESPECIALIDADES)]
+    df = df[df["Especialidad"].isin(list(ESPECIALIDADES) + ["MEDICINA_FAMILIAR"])]
     idx: dict[str, list[set[str]]] = {}
     for _, r in df.iterrows():
         toks = set(name_tokens(str(r.get("Nombre", ""))))
@@ -432,8 +513,19 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
                      "Email": email})
 
     # Dedupe: misma provincia + especialidad, tokens del nombre corto ⊂ nombre largo. Preferir masquemedicos (trae tel.)
-    SRC_RANK = {"masquemedicos": 0, "iess": 1, "hsvp_ibarra": 1, "ecuadoctor": 2, "doctoranytime": 3}
-    recs.sort(key=lambda x: (SRC_RANK.get(x["Fuente"], 9), -len(x["_tokens"])))
+    SRC_RANK = {"masquemedicos": 0, "ecuadoctor": 2, "doctoranytime": 3}  # LOTAIP (iess, hsvp, lotaip_*) = 1
+    recs.sort(key=lambda x: x.get("Fecha_fuente") or "", reverse=True)  # más reciente primero
+    # Un email institucional = una persona: si cambió de ciudad entre directorios, vale el más reciente
+    seen_mail: set[str] = set()
+    uniq = []
+    for r in recs:
+        if r["Email"] and r.get("Fecha_fuente"):
+            if r["Email"] in seen_mail:
+                continue
+            seen_mail.add(r["Email"])
+        uniq.append(r)
+    recs = uniq
+    recs.sort(key=lambda x: (SRC_RANK.get(x["Fuente"], 1), -len(x["_tokens"])))
     kept: list[dict] = []
     for r in recs:
         ts = set(r["_tokens"])
@@ -466,7 +558,8 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
     # Orden de prioridad dentro de cada grupo: provincia pedida antes que vecinas,
     # pediatras (escasos) > medicina general > medicina interna, luego con teléfono/email
     df["_vecina"] = (df["Provincia"] != df["Grupo"]).astype(int)
-    df["_esp"] = df["Especialidad"].map({"PEDIATRIA": 0, "MEDICINA_GENERAL": 1, "MEDICINA_INTERNA": 2})
+    df["_esp"] = df["Especialidad"].map({"PEDIATRIA": 0, "MEDICINA_GENERAL": 1, "MEDICINA_FAMILIAR": 2,
+                                         "MEDICINA_EMERGENCIAS": 3, "MEDICINA_INTERNA": 4})
     df = df.sort_values(["Grupo", "_vecina", "_esp", "_score"], ascending=[True, True, True, False])
     if cap:
         df = df.groupby("Grupo", group_keys=False).head(cap)
@@ -489,8 +582,10 @@ def write_excel(df: pd.DataFrame, out: Path, meta: int) -> None:
             "Medicina General": int((d.Especialidad == "MEDICINA_GENERAL").sum()),
             "Pediatría": int((d.Especialidad == "PEDIATRIA").sum()),
             "Medicina Interna": int((d.Especialidad == "MEDICINA_INTERNA").sum()),
+            "Medicina Familiar": int((d.Especialidad == "MEDICINA_FAMILIAR").sum()),
+            "Emergencias": int((d.Especialidad == "MEDICINA_EMERGENCIAS").sum()),
             "Total": len(d),
-            "Provincia pedida (MG+Ped)": int((pedida.Especialidad != "MEDICINA_INTERNA").sum()),
+            "Provincia pedida (MG+Ped)": int(pedida.Especialidad.isin(["MEDICINA_GENERAL", "PEDIATRIA"]).sum()),
             "Por provincia": ", ".join(f"{k}: {v}" for k, v in d.Provincia.value_counts().items()),
             "Meta": meta,
             "Brecha": max(meta - len(d), 0),
@@ -528,9 +623,9 @@ def main() -> None:
     raw: list[dict] = []
     for name, fn in [("masquemedicos", scrape_masquemedicos), ("doctoranytime", scrape_doctoranytime),
                      ("ecuadoctor", scrape_ecuadoctor),
-                     ("lotaip", lambda s: scrape_lotaip(s, out_dir))]:
+                     ("lotaip", lambda s: scrape_lotaip(s, out_dir, args.data_dir / LOTAIP_INPUT_DIR))]:
         cache = out_dir / f"EC_raw_{name}.json"
-        if cache.exists() and not args.refresh:
+        if cache.exists() and not args.refresh and name != "lotaip":
             rows = json.loads(cache.read_text())
             print(f"  cache {cache.name}: {len(rows)}")
         else:
