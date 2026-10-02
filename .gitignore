@@ -19,3 +19,4 @@ data/snapshots/*
 .idea/
 .vscode/
 .remember/
+logs/
