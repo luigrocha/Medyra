@@ -5,7 +5,7 @@ Guía para agentes (Claude Code u otros) que trabajen en este repo. Léela compl
 ## Qué es
 
 Recolección de **información pública de médicos** en Latinoamérica (nombre, especialidad, ciudad, teléfono, email) para
-entregables en Excel. Países activos: **Costa Rica, Panamá, Ecuador**; Colombia en rama aparte.
+entregables en Excel. Países activos: **Costa Rica, Panamá, Ecuador, Colombia** (ginecología).
 El entregable típico pide **N médicos por ciudad/provincia y especialidad, con teléfono Y email**.
 Idioma de trabajo con el usuario: **español**. Entregables con nivel CTO: números reales, fuentes citadas, brechas explícitas.
 
@@ -28,9 +28,10 @@ ruff check src scripts tests
 ## Estructura
 
 ```
-src/medintel/    paquete que usan scripts/ y tests/ (imports `from medintel...`)
-src/medyra/      copia renombrada (lo que empaqueta pyproject + CLI `medyra`). Rename a medias:
-                 si cambias lógica compartida, cámbiala en AMBOS o consolida primero.
+src/medintel/    paquete original: lo importan tests/ y la mayoría de scripts/ (`from medintel...`)
+src/medyra/      copia renombrada: lo que empaqueta pyproject + CLI `medyra`; los scripts de Colombia
+                 ya importan `medyra`. Rename a medias: si cambias lógica compartida, cámbiala en
+                 AMBOS o consolida primero.
   normalization/ names.py (parse_latam_name, family_first/given_first), phones.py (E.164 via phonenumbers),
                  emails.py, specialties.py
   inference/     confidence, identity, email_patterns
@@ -40,6 +41,9 @@ scripts/         scrapers y pipelines por país (standalone, ver abajo)
 schema.sql       modelo claim-based (physician, observation, claim, review_task, pgvector)
 tests/unit/      pytest; fixtures HTML en tests/fixtures/
 data/            NO versionado (ver "Datos")
+logs/            logs por corrida (ignorado)
+.kilo/agents/    agentes de Kilo Code (p. ej. `data.md`: análisis en notebooks Jupyter)
+*.xlsx / PA_*.csv en la raíz: entregables antiguos versionados a mano (no regenerar ahí)
 ```
 
 ## Datos (`data/` está en .gitignore)
@@ -91,12 +95,25 @@ de esas provincias a `data/input/lotaip/`, luego re-ejecutar el script.
 usar `strict_name_score`). Fuentes y conteos en README.md.
 
 ### Panamá
-`scripts/auto_scraper_cliniweb.py` (cron, `setup_cron.sh`), `scripts/scraper_cliniweb_pa.py`, `scrape_pa_*`.
+`scripts/auto_scraper_cliniweb.py` (cron, `setup_cron.sh`), `scripts/scraper_cliniweb_pa.py`,
+`scrape_pa_full.py` / `scrape_pa_especialidad.py` / `scrape_pa_esp_async.py` (Cliniweb por especialidad; el async
+no tiene pausas — bajar concurrencia si el sitio empieza a fallar).
 Cliniweb: seed fijo `639148726507040344` para paginación consistente.
 
-### Colombia (rama `claude/gynecologists-database-colombia-632b80`, aún sin PR)
-`scrape_doctoralia_co.py`, `reps_colombia.py` (REPS MinSalud, emails/teléfonos oficiales), `enrich_emails_co.py`,
-`build_colombia_dataset.py`.
+### Colombia — ginecología (generalizable con `--specialty <slug>`)
+```bash
+python scripts/scrape_doctoralia_co.py --phase all        # listing → cities → profiles → export (reanudable)
+python scripts/reps_colombia.py --download --match         # REPS MinSalud (datos.gov.co c36g-9fc2) + cruce
+python scripts/build_colombia_dataset.py --seed-csv "ruta/semilla.csv"
+python scripts/enrich_emails_co.py --limit 100            # opcional, vía DDG (bloquea a escala)
+```
+- Doctoralia CO da la especialidad y teléfono de consultorio, **nunca email**. El teléfono está en el DOM
+  (`data-id="address-<id>-<tel>-1-phone"`), no requiere JS.
+- El WAF de Doctoralia responde **405** a headers de bot: no recortar `HEADERS` en `scrape_doctoralia_co.py`.
+- **REPS** (Registro Especial de Prestadores) es la fuente oficial de email/teléfono; no trae especialidad → se cruza
+  por nombre de forma conservadora (`classify_match()`); confianza baja/ambigua va a hoja `Revision_Manual`.
+- Precedencia de email: semilla del cliente > REPS alta > REPS media > web > vacío.
+- Cliniweb no opera en Colombia; RETHUS (`my8c-6xkk`) es agregado, sin nombres.
 
 ### Pipeline general (ingesta / enriquecimiento)
 `scripts/ingest_excel.py` (limpia Allegra por hoja/país), `scripts/enrich_fast.py`, `scripts/enrich_cr_pa.py`,
@@ -104,7 +121,7 @@ Cliniweb: seed fijo `639148726507040344` para paginación consistente.
 
 ## Qué NO funciona (no reintentar sin motivo nuevo)
 
-- **Doctoralia no opera en EC, CR ni PA** (sí en MX, CO, PE, CL, ES).
+- **Doctoralia no opera en EC, CR ni PA** (sí en MX, CO, PE, CL, ES; en CO ya se usa).
 - **Bing / DuckDuckGo**: bloquean/throttlean scraping de búsqueda tras pocas queries.
 - **ecuamedical.com**: ahora solo Quito. **citamedica.ec**: casi vacío. **ACESS / datosabiertos.gob.ec**: 403, sin provincia.
 - Directorios de clínicas privadas (Santa Inés, Del Río, Monte Sinaí): nombres y especialidad, **sin email**.
@@ -127,4 +144,5 @@ Cliniweb: seed fijo `639148726507040344` para paginación consistente.
 
 - `main` es la base. Trabajar en ramas `claude/<tema>` (worktrees en `.claude/worktrees/`). PR a `main` con `gh pr create`.
 - Commits: mensaje en inglés estilo conventional (`feat(scraper): …`), explicando el porqué.
-- No versionar datos (`data/`), ni `.env`, ni `.kilo/`.
+- No versionar datos (`data/`), `logs/`, ni `.env`. De `.kilo/` solo se versiona `agents/`;
+  no agregar `.kilo/worktrees/` ni archivos locales de Kilo.
