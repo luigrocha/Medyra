@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-Scraper: Ecuador — Médicos Generales + Pediatras por provincia (Azuay, Loja, Carchi)
+Scraper: Ecuador — Médicos Generales, Pediatras e Internistas por provincia (Azuay, Loja, Carchi)
+
+Grupos de entrega (una hoja cada uno): la provincia pedida + vecinas que la complementan
+  Azuay | Loja (+ El Oro, Zamora Chinchipe) | Carchi (+ Imbabura)
+Cada fila lleva su Provincia real y Tipo = "Provincia pedida" / "Provincia vecina".
 
 Fuentes (validadas 2026-09-30):
-  - masquemedicos.ec   /{medicos-generales,pediatras}_{canton}/page/N/   (schema.org, con teléfono)
-  - doctoranytime.ec   /s/{Medico-general,Pediatra}/{canton}              (JSON-LD, solo pág. 1 estática, sin teléfono)
-  Descartadas: ecuamedical (ahora solo Quito), Doctoralia (no opera en EC),
-  citamedica (6 médicos en Cuenca), ACESS/datosabiertos (403, sin provincia).
+  - masquemedicos.ec   /{medicos-generales,pediatras,medicos-internistas}_{canton}/page/N/  (schema.org, con teléfono)
+  - doctoranytime.ec   /s/{Medico-general,Pediatra}/{canton}?p=N   (JSON-LD, sin teléfono; sin categoría de interna)
+  - ecuadoctor.com     /modules/directorio?qry={4,2,17}&cty=CIUDAD   (teléfono + email, pocos registros)
+  Descartadas: ecuamedical (ahora solo Quito), Doctoralia (no opera en EC), citamedica (casi vacío),
+  ACESS/datosabiertos (403, sin provincia), directorios de clínicas detrás de formularios.
 
 Flujo:
   1. scrape  → data/output/EC_raw_{fuente}.json   (cache: re-correr no vuelve a pedir si existe; --refresh)
-  2. build   → dedupe entre fuentes, filtro por provincia, cruce con la base Ecuador existente
-               (medicos-allegra-0226__Ecuador_clean.xlsx) y cap por provincia.
-  Output: data/output/ecuador_azuay_loja_carchi.xlsx (hojas Azuay, Loja, Carchi, Resumen)
+  2. build   → dedupe entre fuentes, provincia según dirección real, cruce con la base Ecuador existente
+               (medicos-allegra-0226__Ecuador_clean.xlsx), tope opcional por grupo (--cap).
+  Output: data/output/ecuador_azuay_loja_carchi.xlsx (hojas Resumen, Azuay, Loja, Carchi)
 
 Uso:
   python scripts/scrape_ecuador_provincias.py --data-dir "<repo>/data"
@@ -48,13 +53,27 @@ PROVINCIAS: dict[str, list[tuple[str, str]]] = {
               ("santa-isabel", "Santa Isabel"), ("giron", "Girón"), ("chordeleg", "Chordeleg"),
               ("camilo-ponce-enriquez", "Camilo Ponce Enríquez"), ("nabon", "Nabón")],
     "Loja": [("loja", "Loja"), ("catamayo", "Catamayo"), ("cariamanga", "Cariamanga"), ("macara", "Macará"),
-             ("saraguro", "Saraguro"), ("alamor", "Alamor"), ("catacocha", "Catacocha"), ("zapotillo", "Zapotillo")],
+             ("saraguro", "Saraguro"), ("alamor", "Alamor"), ("catacocha", "Catacocha"), ("zapotillo", "Zapotillo"),
+             ("celica", "Celica")],
     "Carchi": [("tulcan", "Tulcán"), ("san-gabriel", "San Gabriel"), ("el-angel", "El Ángel"), ("mira", "Mira"),
                ("huaca", "Huaca"), ("bolivar", "Bolívar")],
+    # Provincias vecinas: complementan a Carchi (Imbabura) y a Loja (El Oro, Zamora Chinchipe)
+    "Imbabura": [("ibarra", "Ibarra"), ("otavalo", "Otavalo"), ("cotacachi", "Cotacachi"),
+                 ("atuntaqui", "Atuntaqui"), ("pimampiro", "Pimampiro"), ("urcuqui", "Urcuquí")],
+    "El Oro": [("machala", "Machala"), ("pasaje", "Pasaje"), ("santa-rosa", "Santa Rosa"),
+               ("huaquillas", "Huaquillas"), ("pinas", "Piñas"), ("zaruma", "Zaruma"),
+               ("el-guabo", "El Guabo"), ("arenillas", "Arenillas"), ("portovelo", "Portovelo")],
+    "Zamora Chinchipe": [("zamora", "Zamora"), ("yantzaza", "Yantzaza"), ("zumba", "Zumba")],
 }
+# Provincia real → grupo de entrega (hoja del Excel)
+GRUPO = {"Azuay": "Azuay", "Loja": "Loja", "Carchi": "Carchi",
+         "Imbabura": "Carchi", "El Oro": "Loja", "Zamora Chinchipe": "Loja"}
+GRUPOS = ["Azuay", "Loja", "Carchi"]
 ESPECIALIDADES = {
     "MEDICINA_GENERAL": {"masquemedicos": "medicos-generales", "doctoranytime": "Medico-general"},
     "PEDIATRIA": {"masquemedicos": "pediatras", "doctoranytime": "Pediatra"},
+    # doctoranytime.ec no tiene categoría de medicina interna
+    "MEDICINA_INTERNA": {"masquemedicos": "medicos-internistas", "doctoranytime": None},
 }
 TITLES = {"DR", "DRA", "DOCTOR", "DOCTORA", "MD", "MG", "ESP", "MSC", "LIC"}
 # Fichas que son establecimientos, no personas
@@ -149,41 +168,281 @@ def scrape_doctoranytime(session: httpx.Client) -> list[dict]:
     for prov, cantones in PROVINCIAS.items():
         for slug, canton in cantones:
             for esp, paths in ESPECIALIDADES.items():
-                url = f"https://www.doctoranytime.ec/s/{paths['doctoranytime']}/{slug}"
-                try:
-                    r = session.get(url, headers=HEADERS)
-                except httpx.HTTPError as e:
-                    print(f"    ! {url}: {e}")
+                if not paths["doctoranytime"]:
                     continue
-                if r.status_code != 200:
-                    continue
-                n = 0
-                for block in re.findall(r'<script type="application/ld(?:\+|&#x2B;)json">(.*?)</script>', r.text, re.S):
+                base = f"https://www.doctoranytime.ec/s/{paths['doctoranytime']}/{slug}"
+                n, page = 0, 1
+                while page <= 15:
+                    url = base if page == 1 else f"{base}?p={page}"
                     try:
-                        data = json.loads(block)
-                    except json.JSONDecodeError:
-                        continue
-                    for p in _iter_physicians(data):
-                        addrs = p.get("address") or []
-                        if isinstance(addrs, dict):
-                            addrs = [addrs]
-                        a0 = addrs[0] if addrs else {}
-                        urls = p.get("url")
-                        rows.append({
-                            "Fuente": "doctoranytime",
-                            "Nombre": re.sub(r"\b(Dra?\.?)\s*$", "", p.get("name", "")).strip(),
-                            "Especialidad": esp,
-                            "Canton_busqueda": canton,
-                            "Provincia_busqueda": prov,
-                            "Ciudad": a0.get("addressLocality", ""),
-                            "Region": a0.get("addressRegion", ""),
-                            "Direccion": a0.get("streetAddress", ""),
-                            "Telefono_raw": p.get("telephone", ""),
-                            "URL": (urls[0] if isinstance(urls, list) and urls else urls) or p.get("@id", "").split("#")[0],
-                        })
-                        n += 1
+                        r = session.get(url, headers=HEADERS)
+                    except httpx.HTTPError as e:
+                        print(f"    ! {url}: {e}")
+                        break
+                    if r.status_code != 200:
+                        break
+                    page_rows = []
+                    for block in re.findall(r'<script type="application/ld(?:\+|&#x2B;)json">(.*?)</script>', r.text, re.S):
+                        try:
+                            data = json.loads(block)
+                        except json.JSONDecodeError:
+                            continue
+                        for p in _iter_physicians(data):
+                            addrs = p.get("address") or []
+                            if isinstance(addrs, dict):
+                                addrs = [addrs]
+                            a0 = addrs[0] if addrs else {}
+                            urls = p.get("url")
+                            page_rows.append({
+                                "Fuente": "doctoranytime",
+                                "Nombre": re.sub(r"\b(Dra?\.?)\s*$", "", p.get("name", "")).strip(),
+                                "Especialidad": esp,
+                                "Canton_busqueda": canton,
+                                "Provincia_busqueda": prov,
+                                "Ciudad": a0.get("addressLocality", ""),
+                                "Region": a0.get("addressRegion", ""),
+                                "Direccion": a0.get("streetAddress", ""),
+                                "Telefono_raw": p.get("telephone", ""),
+                                "URL": (urls[0] if isinstance(urls, list) and urls else urls) or p.get("@id", "").split("#")[0],
+                            })
+                    rows += page_rows
+                    n += len(page_rows)
+                    # Para cantones chicos el sitio rellena con médicos "cerca de" (la capital):
+                    # solo se pagina mientras la página sea mayormente del cantón buscado
+                    in_canton = [x for x in page_rows
+                                 if strip_accents(x["Ciudad"]).upper() == strip_accents(canton).upper()]
+                    if len(page_rows) < 20 or len(in_canton) < len(page_rows) / 2:
+                        break
+                    page += 1
+                    time.sleep(SLEEP)
                 print(f"  [doctoranytime] {canton} {esp}: {n}")
                 time.sleep(SLEEP)
+    return rows
+
+
+# --------------------------------------------------------------------------- ecuadoctor
+ECUADOCTOR_QRY = {"MEDICINA_GENERAL": 4, "PEDIATRIA": 2, "MEDICINA_INTERNA": 17}
+# Ciudades que el sitio tiene en su selector, dentro de las 3 provincias
+ECUADOCTOR_CTY = {"CUENCA": "Azuay", "GUALACEO": "Azuay", "LOJA": "Loja", "CATAMAYO": "Loja",
+                  "MACARA": "Loja", "TULCAN": "Carchi",
+                  "IBARRA": "Imbabura", "OTAVALO": "Imbabura", "ATUNTAQUI": "Imbabura", "COTACACHI": "Imbabura",
+                  "MACHALA": "El Oro", "SANTA ROSA | EL ORO": "El Oro",
+                  "YANTZAZA": "Zamora Chinchipe", "YACUAMBI": "Zamora Chinchipe"}
+ECUADOCTOR_ESP_OK = {"MEDICINA_GENERAL": re.compile(r"MEDIC(INA|O) GENERAL", re.I),
+                     "PEDIATRIA": re.compile(r"PEDIATR", re.I),
+                     "MEDICINA_INTERNA": re.compile(r"INTERN", re.I)}
+
+
+def scrape_ecuadoctor(session: httpx.Client) -> list[dict]:
+    rows: list[dict] = []
+    for cty, prov in ECUADOCTOR_CTY.items():
+        for esp, qry in ECUADOCTOR_QRY.items():
+            url = "https://www.ecuadoctor.com/modules/directorio"
+            try:
+                r = session.get(url, params={"qry": qry, "cty": cty}, headers=HEADERS)
+            except httpx.HTTPError as e:
+                print(f"    ! {url}: {e}")
+                continue
+            soup = HTMLParser(r.text)
+            seen, n = set(), 0
+            for card in soup.css("div#filaped"):
+                m = re.search(r"abremedico\((\d+)", card.attributes.get("onclick") or "")
+                if not m or m.group(1) in seen:
+                    continue
+                seen.add(m.group(1))
+                esp_el = card.css_first("#nombremed2")
+                esp_txt = esp_el.text(strip=True) if esp_el else ""
+                if not ECUADOCTOR_ESP_OK[esp].search(strip_accents(esp_txt)):
+                    continue
+                a = card.css_first("#nombremed a")
+                dire = card.css_first("#direcmed p")
+                fono = card.css_first("#fonomed p")
+                mail = card.css_first("#mailmed p")
+                addr = dire.text(separator=" ", strip=True) if dire else ""
+                phones = re.findall(r"\(?0\d\)?[\s-]?\d{6,8}|\b0?9\d{8}\b|\b[2-7]\d{6}\b", fono.text() if fono else "")
+                rows.append({
+                    "Fuente": "ecuadoctor",
+                    "Nombre": re.sub(r"^(Dra?\.?)\s+", "", a.text(strip=True) if a else "").strip(),
+                    "Especialidad": esp,
+                    "Canton_busqueda": cty.split("|")[0].strip().title(),
+                    "Provincia_busqueda": prov,
+                    "Ciudad": addr.rsplit("|", 1)[-1].strip().title() if "|" in addr else cty.split("|")[0].strip().title(),
+                    "Direccion": addr,
+                    "Telefono_raw": phones[0] if phones else "",
+                    "Email_raw": (mail.text(strip=True) if mail else ""),
+                    "URL": f"https://www.ecuadoctor.com/modules/medico?id={m.group(1)}",
+                })
+                n += 1
+            print(f"  [ecuadoctor] {cty} {esp}: {n}")
+            time.sleep(SLEEP)
+    return rows
+
+
+# --------------------------------------------------------------------------- LOTAIP
+# Directorios institucionales publicados por ley (LOTAIP art. 7 literal b1): nombre, puesto, ciudad,
+# teléfono y email institucional de cada servidor. Formato estándar en todo el sector público.
+LOTAIP_DOCS = [
+    # (fuente, fecha, url, archivo cache) — el más reciente primero: gana en el dedupe
+    ("iess", "2023-09", "https://www.iess.gob.ec/informacion/Transparencia/Septiembre_2023/Literal_b1.pdf",
+     "iess_lotaip_b1_2023-09.pdf"),
+    ("iess", "2023-06", "https://www.iess.gob.ec/informacion/Transparencia/Junio_2023/Literal_b1.pdf",
+     "iess_lotaip_b1_2023-06.pdf"),
+    # Hospital San Vicente de Paúl (MSP, Ibarra) — carpeta LOTAIP 2024 en hsvp.gob.ec
+    ("hsvp_ibarra", "2024", "https://drive.google.com/uc?export=download&id=18eSQRIm6UEfXbyVYPDz4XsyNu9yQCuSh",
+     "hsvp_lotaip_b1_2024.pdf"),
+]
+LOTAIP_PUESTO = [
+    (re.compile(r"^MEDICO/A GENERAL\b"), "MEDICINA_GENERAL"),
+    (re.compile(r"^MEDICO/A ESPECIALISTA EN PEDIATRIA\b"), "PEDIATRIA"),
+    (re.compile(r"^MEDICO/A ESPECIALISTA EN MEDICINA INTERNA\b"), "MEDICINA_INTERNA"),
+    (re.compile(r"^MEDICO/A ESPECIALISTA EN MEDICINA FAMILIAR\b"), "MEDICINA_FAMILIAR"),
+    (re.compile(r"^MEDICO/A ESPECIALISTA EN EMERGENCIA"), "MEDICINA_EMERGENCIAS"),
+]
+# Directorios LOTAIP descargados a mano (p. ej. MSP, que no responde desde todas las redes):
+# data/input/lotaip/*.pdf|csv|xlsx — la fuente toma el nombre del archivo
+LOTAIP_INPUT_DIR = "input/lotaip"
+_LOTAIP_PHONE = re.compile(r" (\(593\)\s*0?\d[\d ]{6,10}\d|0\d{8})\b")
+
+
+def _lotaip_row(fuente: str, fecha: str, url: str, nombre: str, puesto: str, ciudad_txt: str,
+                telefono: str, email: str, unidad: str, cantones: list) -> dict | None:
+    esp = next((e for rx, e in LOTAIP_PUESTO if rx.search(strip_accents(puesto).upper())), None)
+    if not esp:
+        return None
+    ciudad_up = " " + strip_accents(ciudad_txt).upper().strip()
+    hit = next(((prov, canon) for c, prov, canon in cantones if ciudad_up.endswith(" " + c)), None)
+    if not hit:
+        return None
+    prov, canon = hit
+    email = email.strip()
+    return {
+        "Fuente": fuente,
+        "Nombre": nombre.strip().title(),  # formato APELLIDOS NOMBRES
+        "Especialidad": esp,
+        "Canton_busqueda": canon,
+        "Provincia_busqueda": prov,
+        "Ciudad": canon,
+        "Direccion": unidad,
+        "Telefono_raw": re.sub(r"^\(?593\)?\s*", "", telefono.strip()),
+        # el PDF a veces corta el ".ec" final en otra línea
+        "Email_raw": email + (".ec" if email.lower().endswith(".gob") else ""),
+        "URL": url,
+        "Fecha_fuente": fecha,
+    }
+
+
+def _cantones() -> list[tuple[str, str, str]]:
+    return [(strip_accents(nombre).upper(), prov, nombre) for prov, lst in PROVINCIAS.items() for _, nombre in lst]
+
+
+def parse_lotaip(pdf: Path, fuente: str, fecha: str, url: str) -> list[dict]:
+    from pypdf import PdfReader  # solo estas fuentes lo necesitan
+
+    txt = "\n".join(pg.extract_text() for pg in PdfReader(pdf).pages)
+    txt = re.sub(r"No\. Apellidos y Nombres.*?Correo Electr[oó]nico institucional", "", txt, flags=re.S)
+    txt = re.sub(r"Art\. 7 de la Ley.*?\n|Literal b1\).*?\n|logotipo institucional imagen jpg", "", txt)
+    cantones = _cantones()
+    rows: list[dict] = []
+    prev = 0
+    # Cada registro termina en su email: se corta el texto email a email
+    for m in re.finditer(r"[\w.+-]+@[\w.-]+\.\w+", txt):
+        rec = re.sub(r"\s+", " ", txt[prev:m.start()]).strip()
+        prev = m.end()
+        mm = re.match(r"\d+ (.+?) (M[EÉ]DICO/A .+)$", rec, re.I)
+        if not mm:
+            continue
+        nombre, resto = mm.groups()
+        ph = _LOTAIP_PHONE.search(resto)
+        if not ph:
+            continue
+        row = _lotaip_row(fuente, fecha, url, nombre, resto, resto[:ph.start()], ph.group(1), m.group(0),
+                          resto[:ph.start()], cantones)
+        if row:
+            rows.append(row)
+    return rows
+
+
+def parse_lotaip_tabular(path: Path, fuente: str) -> list[dict]:
+    """CSV/XLSX de datos abiertos LOTAIP (formato 2024+): se detectan las columnas por su encabezado."""
+    if path.suffix.lower() == ".csv":
+        df = None
+        for enc in ("utf-8-sig", "latin-1"):
+            try:
+                df = pd.read_csv(path, sep=None, engine="python", dtype=str, encoding=enc)
+                break
+            except UnicodeDecodeError:
+                continue
+    else:
+        df = pd.read_excel(path, dtype=str)
+    if df is None or df.empty:
+        return []
+    # El encabezado a veces no está en la primera fila: buscar la fila que nombra "correo"
+    if not any("correo" in str(c).lower() for c in df.columns):
+        for i in range(min(15, len(df))):
+            if any("correo" in str(v).lower() for v in df.iloc[i].values):
+                df.columns = df.iloc[i].values
+                df = df.iloc[i + 1:]
+                break
+
+    def col(*keys: str) -> str | None:
+        for c in df.columns:
+            cl = strip_accents(str(c)).lower()
+            if all(k in cl for k in keys):
+                return c
+        return None
+
+    c_nom = col("apellidos") or col("nombre")
+    c_pue = col("puesto") or col("cargo")
+    c_ciu = col("ciudad") or col("canton")
+    c_tel = col("telefono")
+    c_ext = col("extension")
+    c_mail = col("correo")
+    c_uni = col("unidad")
+    if not all([c_nom, c_pue, c_ciu, c_mail]):
+        print(f"  [lotaip] {path.name}: no se reconocen columnas {list(df.columns)[:12]}")
+        return []
+    cantones = _cantones()
+    rows = []
+    for r in df.fillna("").to_dict("records"):
+        tel = str(r.get(c_tel, "")) if c_tel else ""
+        row = _lotaip_row(fuente, "", str(path.name), str(r[c_nom]), str(r[c_pue]), str(r[c_ciu]),
+                          tel, str(r[c_mail]), str(r.get(c_uni, "")) if c_uni else "", cantones)
+        if row:
+            if c_ext and str(r.get(c_ext, "")).strip().isdigit():
+                row["Direccion"] = f"{row['Direccion']} (ext. {str(r[c_ext]).strip()})".strip()
+            rows.append(row)
+    return rows
+
+
+def scrape_lotaip(session: httpx.Client, cache_dir: Path, input_dir: Path) -> list[dict]:
+    try:
+        import pypdf  # noqa: F401
+    except ImportError:
+        print("  [lotaip] falta pypdf (pip install pypdf) → se omite la fuente")
+        return []
+    rows: list[dict] = []
+    for fuente, fecha, url, fname in LOTAIP_DOCS:
+        pdf = cache_dir / fname
+        if not pdf.exists():
+            print(f"  [lotaip] descargando {fuente}: {url}")
+            with session.stream("GET", url, headers=HEADERS, timeout=300) as r:
+                r.raise_for_status()
+                with pdf.open("wb") as f:
+                    for chunk in r.iter_bytes():
+                        f.write(chunk)
+        got = parse_lotaip(pdf, fuente, fecha, url)
+        print(f"  [lotaip] {fuente} ({fecha}): {len(got)} médicos en las provincias objetivo")
+        rows += got
+    for f in sorted(input_dir.glob("*")) if input_dir.exists() else []:
+        fuente = "lotaip_" + re.sub(r"[^a-z0-9]+", "_", strip_accents(f.stem).lower()).strip("_")
+        if f.suffix.lower() == ".pdf":
+            got = parse_lotaip(f, fuente, "", f.name)
+        elif f.suffix.lower() in (".csv", ".xlsx", ".xls"):
+            got = parse_lotaip_tabular(f, fuente)
+        else:
+            continue
+        print(f"  [lotaip] {f.name}: {len(got)} médicos en las provincias objetivo")
+        rows += got
     return rows
 
 
@@ -210,7 +469,7 @@ def load_allegra(data_dir: Path) -> dict[str, list[set[str]]]:
         print(f"  (sin base Ecuador existente en {f})")
         return {}
     df = pd.read_excel(f)
-    df = df[df["Especialidad"].isin(ESPECIALIDADES)]
+    df = df[df["Especialidad"].isin(list(ESPECIALIDADES) + ["MEDICINA_FAMILIAR"])]
     idx: dict[str, list[set[str]]] = {}
     for _, r in df.iterrows():
         toks = set(name_tokens(str(r.get("Nombre", ""))))
@@ -241,12 +500,32 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
         toks = name_tokens(r["Nombre"])
         if len(toks) < 2 or NON_PERSON.search(strip_accents(r["Nombre"]).upper()):
             continue
-        ph = normalize_phone(str(r.get("Telefono_raw") or ""), "EC")
-        recs.append({**r, "Provincia": prov, "_tokens": toks,
-                     "Telefono": ph.e164 if ph else "", "Tipo_Telefono": ph.line_type if ph else ""})
+        tel = re.sub(r"[^\d]", "", str(r.get("Telefono_raw") or ""))
+        if len(tel) == 7:  # fijo sin código de área
+            tel = ("06" if prov in ("Carchi", "Imbabura") else "07") + tel
+        ph = normalize_phone(tel, "EC")
+        email = str(r.get("Email_raw") or "").strip().lower()
+        email = email if re.fullmatch(r"[\w.+-]+@[\w-]+(\.[\w-]+)+", email) else ""
+        ciudad_key = strip_accents(r.get("Ciudad") or "").upper().strip()
+        ciudad = c2p[ciudad_key][1] if ciudad_key in c2p else (r.get("Ciudad") or "")
+        recs.append({**r, "Ciudad": ciudad, "Provincia": prov, "Grupo": GRUPO[prov], "_tokens": toks,
+                     "Telefono": ph.e164 if ph else "", "Tipo_Telefono": ph.line_type if ph else "",
+                     "Email": email})
 
     # Dedupe: misma provincia + especialidad, tokens del nombre corto ⊂ nombre largo. Preferir masquemedicos (trae tel.)
-    recs.sort(key=lambda x: (x["Fuente"] != "masquemedicos", -len(x["_tokens"])))
+    SRC_RANK = {"masquemedicos": 0, "ecuadoctor": 2, "doctoranytime": 3}  # LOTAIP (iess, hsvp, lotaip_*) = 1
+    recs.sort(key=lambda x: x.get("Fecha_fuente") or "", reverse=True)  # más reciente primero
+    # Un email institucional = una persona: si cambió de ciudad entre directorios, vale el más reciente
+    seen_mail: set[str] = set()
+    uniq = []
+    for r in recs:
+        if r["Email"] and r.get("Fecha_fuente"):
+            if r["Email"] in seen_mail:
+                continue
+            seen_mail.add(r["Email"])
+        uniq.append(r)
+    recs = uniq
+    recs.sort(key=lambda x: (SRC_RANK.get(x["Fuente"], 1), -len(x["_tokens"])))
     kept: list[dict] = []
     for r in recs:
         ts = set(r["_tokens"])
@@ -262,6 +541,8 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
             if r["Fuente"] not in dup["Fuente"]:
                 dup["Fuente"] += f"+{r['Fuente']}"
                 dup["URL_2"] = r["URL"]
+            if not dup.get("Email") and r.get("Email"):
+                dup["Email"] = r["Email"]
             if not dup["Telefono"] and r["Telefono"]:
                 dup["Telefono"], dup["Tipo_Telefono"] = r["Telefono"], r["Tipo_Telefono"]
         else:
@@ -272,38 +553,54 @@ def build(raw: list[dict], data_dir: Path, cap: int) -> pd.DataFrame:
         r["Existente_Allegra"] = "SI" if in_allegra(r["_tokens"], allegra) else "NO"
 
     df = pd.DataFrame(kept)
-    df["_score"] = (df["Telefono"] != "").astype(int)
-    print("  disponibles antes del cap:", df.groupby(["Provincia", "Especialidad"]).size().to_dict())
-    # Pediatras son escasos → se priorizan; luego registros con teléfono
-    df = (df.sort_values(["Provincia", "Especialidad", "_score"], ascending=[True, False, False])
-            .groupby("Provincia", group_keys=False).head(cap))
-    cols = ["Provincia", "Ciudad", "Especialidad", "Nombre", "Telefono", "Tipo_Telefono", "Direccion",
+    df["_score"] = (df["Telefono"] != "").astype(int) + (df["Email"] != "").astype(int)
+    print("  disponibles:", df.groupby(["Provincia", "Especialidad"]).size().to_dict())
+    # Orden de prioridad dentro de cada grupo: provincia pedida antes que vecinas,
+    # pediatras (escasos) > medicina general > medicina interna, luego con teléfono/email
+    df["_vecina"] = (df["Provincia"] != df["Grupo"]).astype(int)
+    df["_esp"] = df["Especialidad"].map({"PEDIATRIA": 0, "MEDICINA_GENERAL": 1, "MEDICINA_FAMILIAR": 2,
+                                         "MEDICINA_EMERGENCIAS": 3, "MEDICINA_INTERNA": 4})
+    df = df.sort_values(["Grupo", "_vecina", "_esp", "_score"], ascending=[True, True, True, False])
+    if cap:
+        df = df.groupby("Grupo", group_keys=False).head(cap)
+    df["Tipo"] = df["_vecina"].map({0: "Provincia pedida", 1: "Provincia vecina"})
+    cols = ["Grupo", "Provincia", "Tipo", "Ciudad", "Especialidad", "Nombre", "Telefono", "Tipo_Telefono", "Email", "Direccion", "Fecha_fuente",
             "Fuente", "Existente_Allegra", "URL", "URL_2"]
     for c in cols:
         if c not in df:
             df[c] = ""
-    return df[cols].fillna("").sort_values(["Provincia", "Especialidad", "Ciudad", "Nombre"])
+    return df[cols].fillna("").sort_values(["Grupo", "Tipo", "Provincia", "Especialidad", "Ciudad", "Nombre"])
 
 
 def write_excel(df: pd.DataFrame, out: Path, meta: int) -> None:
     resumen = []
-    for prov in PROVINCIAS:
-        d = df[df.Provincia == prov]
+    for grupo in GRUPOS:
+        d = df[df.Grupo == grupo]
+        pedida = d[d.Provincia == grupo]
         resumen.append({
-            "Provincia": prov,
+            "Grupo": grupo,
             "Medicina General": int((d.Especialidad == "MEDICINA_GENERAL").sum()),
             "Pediatría": int((d.Especialidad == "PEDIATRIA").sum()),
+            "Medicina Interna": int((d.Especialidad == "MEDICINA_INTERNA").sum()),
+            "Medicina Familiar": int((d.Especialidad == "MEDICINA_FAMILIAR").sum()),
+            "Emergencias": int((d.Especialidad == "MEDICINA_EMERGENCIAS").sum()),
             "Total": len(d),
+            "Provincia pedida (MG+Ped)": int(pedida.Especialidad.isin(["MEDICINA_GENERAL", "PEDIATRIA"]).sum()),
+            "Por provincia": ", ".join(f"{k}: {v}" for k, v in d.Provincia.value_counts().items()),
             "Meta": meta,
             "Brecha": max(meta - len(d), 0),
             "Con teléfono": int((d.Telefono != "").sum()),
+            "Con email": int((d.Email != "").sum()),
+            "Con tel + email": int(((d.Telefono != "") & (d.Email != "")).sum()),
             "Nuevos (no en Allegra)": int((d.Existente_Allegra == "NO").sum()),
             "Fuentes": ", ".join(f"{k}: {v}" for k, v in d.Fuente.value_counts().items()),
         })
     with pd.ExcelWriter(out, engine="openpyxl") as xw:
         pd.DataFrame(resumen).to_excel(xw, sheet_name="Resumen", index=False)
-        for prov in PROVINCIAS:
-            df[df.Provincia == prov].to_excel(xw, sheet_name=prov, index=False)
+        # Contacto completo = teléfono Y email (requisito de uso comercial)
+        df[(df.Telefono != "") & (df.Email != "")].to_excel(xw, sheet_name="Tel+Email", index=False)
+        for grupo in GRUPOS:
+            df[df.Grupo == grupo].to_excel(xw, sheet_name=grupo, index=False)
         for ws in xw.book.worksheets:
             for col in ws.columns:
                 width = max(len(str(c.value or "")) for c in col[:200])
@@ -315,7 +612,8 @@ def write_excel(df: pd.DataFrame, out: Path, meta: int) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", type=Path, default=ROOT / "data")
-    ap.add_argument("--cap", type=int, default=500)
+    ap.add_argument("--cap", type=int, default=0, help="máximo por provincia (0 = sin tope)")
+    ap.add_argument("--meta", type=int, default=500)
     ap.add_argument("--refresh", action="store_true", help="ignorar cache JSON y volver a scrapear")
     args = ap.parse_args()
     out_dir = args.data_dir / "output"
@@ -323,9 +621,11 @@ def main() -> None:
 
     session = httpx.Client(follow_redirects=True, timeout=20)
     raw: list[dict] = []
-    for name, fn in [("masquemedicos", scrape_masquemedicos), ("doctoranytime", scrape_doctoranytime)]:
+    for name, fn in [("masquemedicos", scrape_masquemedicos), ("doctoranytime", scrape_doctoranytime),
+                     ("ecuadoctor", scrape_ecuadoctor),
+                     ("lotaip", lambda s: scrape_lotaip(s, out_dir, args.data_dir / LOTAIP_INPUT_DIR))]:
         cache = out_dir / f"EC_raw_{name}.json"
-        if cache.exists() and not args.refresh:
+        if cache.exists() and not args.refresh and name != "lotaip":
             rows = json.loads(cache.read_text())
             print(f"  cache {cache.name}: {len(rows)}")
         else:
@@ -335,7 +635,7 @@ def main() -> None:
 
     df = build(raw, args.data_dir, args.cap)
     out = out_dir / "ecuador_azuay_loja_carchi.xlsx"
-    write_excel(df, out, args.cap)
+    write_excel(df, out, args.meta)
     print(f"\n→ {out}")
 
 
